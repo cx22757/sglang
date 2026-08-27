@@ -147,6 +147,7 @@ class CacheOperation:
                 keys=[key for t in transfers if t.keys for key in t.keys] or None,
                 hit_policy=transfers[0].hit_policy,
                 indices_from_pool=transfers[0].indices_from_pool,
+                storage_key_span_pages=transfers[0].storage_key_span_pages,
             )
             for transfers in grouped.values()
         ]
