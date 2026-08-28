@@ -218,7 +218,7 @@ def main():
                 except Exception as e:
                     print(f"  [populate] [{i}] FAILED: {e!r}")
                     raise
-                if (i + 1) % 16 == 0:
+                if (i + 1) % a.pop_conc == 0:
                     print(f"  [populate] {i + 1}/{N} done ({time.perf_counter() - t0:.0f}s)")
         print(f"  [populate] {N} prefixes done in {time.perf_counter() - t0:.0f}s")
 
