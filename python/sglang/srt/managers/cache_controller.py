@@ -1077,6 +1077,16 @@ class HiCacheController:
             self.prefetch_sync_queue.put(ack)
         return completed_pages
 
+    def _map_kv_derived_indices(
+        self,
+        pool_name,
+        indices: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        # Base identity mapping; HybridCacheController overrides this to apply
+        # the pool-specific slot_page_size ratio conversion for NPU compressed
+        # pools (C4 / C4_INDEXER) whose slot_page_size < global page_size.
+        return indices
+
     def _page_transfer_kv_batch(
         self,
         operation: PrefetchOperation,
@@ -1103,7 +1113,13 @@ class HiCacheController:
             current_kv_derived_transfers = [
                 PoolTransfer(
                     name=transfer.name,
-                    host_indices=batch_host_indices,
+                    # On NPU, compressed pools (C4/C4_INDEXER) use a smaller
+                    # slot_page_size than the global page_size; the raw KV host
+                    # indices must be remapped to the pool's own index space
+                    # before passing them to get_page_buffer_meta.
+                    host_indices=self._map_kv_derived_indices(
+                        transfer.name, batch_host_indices
+                    ),
                     keys=batch_hashes,
                 )
                 for transfer in kv_derived_transfers
