@@ -17,8 +17,8 @@ Runs ONE matrix cell against a RUNNING server (:30000, pin L1=384K/rank):
 Routing: --route free (default; both populate and measure omit routed_dp_rank,
 server round-robin assigns by arrival; populate & measure submit in index order
 so a replayed prefix lands on the same rank). --route roundrobin sets
-routed_dp_rank=i%16 on populate/replay (measure is native bench -> always free;
-use only if free-routing hits fail).
+routed_dp_rank=i%BACKEND_DP_RANKS on populate/measure/replay; use only if
+free-routing hits fail.
 
 Usage (inside container cx-dsv4):
   python3 -u bench_ids_dsv4.py --input-len 32768 --num-prompts 282 \
@@ -50,6 +50,7 @@ from sglang.benchmark.datasets.common import DatasetRow
 print = functools.partial(print, flush=True)
 
 G = 128 * 16  # 2048 raw tokens per complete C128 group
+BACKEND_DP_RANKS = 8
 MODEL = "/mnt/paas/weights/DeepSeek-V4-Flash-w8a8-mtp"
 BASE = "http://127.0.0.1:30000"
 REPLAY_OUT = 8  # correctness replay output length (populate also uses this)
@@ -195,7 +196,11 @@ def main():
         soff = a.seed_base + 10_000_000
         suffixes = [_make_ids(vocab, special, soff + i, P - pop_len) for i in range(N)]
         meas_inputs = [pref[:pop_len] + suf for pref, suf in zip(prefixes, suffixes)]
-    ranks = [i % 16 for i in range(N)] if a.route == "roundrobin" else [None] * N
+    ranks = (
+        [i % BACKEND_DP_RANKS for i in range(N)]
+        if a.route == "roundrobin"
+        else [None] * N
+    )
     first_out: list = [None] * N
 
     def _populate():
@@ -228,7 +233,9 @@ def main():
                 prompt_len=len(ids),
                 output_len=a.output_len,
                 extra_request_body=(
-                    {"routed_dp_rank": i % 16} if a.route == "roundrobin" else {}
+                    {"routed_dp_rank": i % BACKEND_DP_RANKS}
+                    if a.route == "roundrobin"
+                    else {}
                 ),
             )
             for i, ids in enumerate(meas_inputs)
