@@ -1734,7 +1734,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if prep.alloc_failed:
                 alloc_failed = True
                 break
-            if prep.host_indices is None:
+            if prep.host_indices is None and not prep.deferred_alloc:
                 continue
             transfers = self.tree_core.build_hicache_transfers(
                 ct,
@@ -2236,8 +2236,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.revoke_pending_prefetch(req_id)
                 return True
 
+            kv_hit_pages = alloc_len // self.page_size
+
+            # For non-KV-derived independent pools (e.g. C128) that opted for
+            # deferred allocation, allocate exactly the hit-sized slots now.
+            if not cc._alloc_deferred_independent_transfers(
+                operation.pool_transfers, kv_hit_pages
+            ):
+                cc.mem_pool_host.free(host_indices)
+                if buffer_mode:
+                    return False
+                self.revoke_pending_prefetch(req_id)
+                return True
+
+            # For non-KV-derived independent pools that were pre-allocated,
+            # trim the tail beyond the resolved hit boundary.
             if not cc._trim_independent_storage_transfers(
-                operation.pool_transfers, alloc_len // self.page_size
+                operation.pool_transfers, kv_hit_pages
             ):
                 cc.mem_pool_host.free(host_indices)
                 if buffer_mode:

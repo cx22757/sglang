@@ -401,16 +401,10 @@ class C128SidecarComponent(TreeComponent):
         if num_groups == 0:
             return PreparePrefetchResult()
 
-        page_size = self.allocator.c128_attn_allocator.page_size
-        num_slots = num_groups * page_size
-        host_indices = self._c128_kv_pool_host.alloc(num_slots)
-        if host_indices is None:
-            # C128 host pressure is reclaimed only through Full host leaves.
-            self.cache.evict_host(num_slots * 128, ComponentType.FULL)
-            host_indices = self._c128_kv_pool_host.alloc(num_slots)
-        if host_indices is None:
-            return PreparePrefetchResult(alloc_failed=True)
-        return PreparePrefetchResult(host_indices=host_indices)
+        # Signal that build_hicache_transfers should be called with host_indices=None;
+        # actual allocation is deferred to _try_alloc_storage_hit once the real hit
+        # count is known, avoiding pre-alloc → align → trim waste.
+        return PreparePrefetchResult(host_indices=None, deferred_alloc=True)
 
     @staticmethod
     def _expand_page_indices(page_ids: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -501,7 +495,6 @@ class C128SidecarComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
             assert token_ids is not None
             _, group_tokens, span_pages = self._storage_geometry()
             assert self._node_depth(node) % group_tokens == 0
@@ -512,10 +505,11 @@ class C128SidecarComponent(TreeComponent):
             keys = full_hashes[span_pages - 1 :: span_pages]
             expected_groups = prefetch_tokens // group_tokens
             assert len(keys) == expected_groups
-            assert host_indices.numel() == len(keys) * page_size, (
-                f"C128 prefetch geometry mismatch: indices={host_indices.numel()} "
-                f"keys={len(keys)} page_size={page_size}"
-            )
+            if host_indices is not None:
+                assert host_indices.numel() == len(keys) * page_size, (
+                    f"C128 prefetch geometry mismatch: indices={host_indices.numel()} "
+                    f"keys={len(keys)} page_size={page_size}"
+                )
             return [
                 PoolTransfer(
                     name=PoolName.DEEPSEEK_V4_C128,

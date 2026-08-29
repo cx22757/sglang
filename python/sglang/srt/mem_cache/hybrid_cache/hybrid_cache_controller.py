@@ -669,6 +669,7 @@ class HybridCacheController(BaseHiCacheController):
                 transfer
                 for transfer in operation.pool_transfers
                 if transfer.indices_from_pool != PoolName.KV
+                and transfer.keys  # skip deferred transfers with no hit groups
             ]
             self._sync_trailing_keys(
                 transfers_nonkv, operation.hash_value, kv_completed_pages
@@ -859,6 +860,52 @@ class HybridCacheController(BaseHiCacheController):
         if slot_page_size > 0 and self.page_size % slot_page_size == 0:
             ratio = self.page_size // slot_page_size
         return indices // ratio if ratio > 1 else indices
+
+    def _alloc_deferred_independent_transfers(
+        self,
+        pool_transfers: Optional[list[PoolTransfer]],
+        kv_hit_pages: int,
+    ) -> bool:
+        """Allocate host slots for deferred-alloc independent pools (host_indices=None).
+
+        Called after the FULL host allocation so the exact hit count is known.
+        Computes the number of complete native pages from kv_hit_pages and the
+        pool's storage_key_span_pages, allocates precisely that many slots, and
+        fills transfer.host_indices in place.  Returns False on allocation failure.
+        """
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None:
+                continue
+            span = transfer.storage_key_span_pages
+            if span is None or transfer.indices_from_pool is not None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            page_size = getattr(entry.host_pool, "page_size", 0)
+            if page_size <= 0 or span <= 0:
+                continue
+            num_keys = kv_hit_pages // span
+            if num_keys == 0:
+                # No complete groups fit the hit; leave host_indices=None and
+                # keys=None so _page_transfer_sidecar skips this transfer.
+                transfer.keys = None
+                continue
+            num_slots = num_keys * page_size
+            host_indices = entry.host_pool.alloc(num_slots)
+            if host_indices is None and entry.host_evict_fn is not None:
+                entry.host_evict_fn(num_slots)
+                host_indices = entry.host_pool.alloc(num_slots)
+            if host_indices is None:
+                logger.warning(
+                    "Deferred host alloc failed: pool=%s need=%d slots",
+                    transfer.name,
+                    num_slots,
+                )
+                return False
+            transfer.host_indices = host_indices
+            transfer.keys = (transfer.keys or [])[:num_keys]
+        return True
 
     def storage_prefetch_alignment(
         self, pool_transfers: Optional[list[PoolTransfer]]
