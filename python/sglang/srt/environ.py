@@ -1312,6 +1312,11 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Debug: emit [KVSUM] per-layer digest lines in server.log for populate-write
+    # vs replay-read comparison. SGLANG_DSV4_KV_DIGEST_LAYERS overrides the
+    # default set (all compress layers); comma-separated layer ids.
+    SGLANG_DSV4_KV_DIGEST = EnvBool(False)
+    SGLANG_DSV4_KV_DIGEST_LAYERS = EnvStr("")
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

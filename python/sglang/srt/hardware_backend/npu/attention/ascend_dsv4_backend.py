@@ -823,6 +823,187 @@ class DeepseekV4AscendAttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None
         }
+        self._kv_digest_layers: Optional[list[int]] = None
+        self._kv_digest_seen: set[tuple[str, int]] = set()
+
+    def _kv_digest_layers_resolved(self) -> list[int]:
+        if self._kv_digest_layers is None:
+            spec = envs.SGLANG_DSV4_KV_DIGEST_LAYERS.get()
+            if spec:
+                self._kv_digest_layers = [
+                    int(x) for x in spec.split(",") if x.strip()
+                ]
+            else:
+                self._kv_digest_layers = [
+                    lid
+                    for lid, item in enumerate(self.token_to_kv_pool.layer_mapping)
+                    if item is not None and item.compress_ratio in (4, 128)
+                ]
+        return self._kv_digest_layers
+
+    @staticmethod
+    def _kv_digest_sum(t: Optional[torch.Tensor]):
+        if t is None or t.numel() == 0:
+            return None
+        return round(float(t.abs().float().sum().item()), 6)
+
+    def _kv_indexer_digest(self, layer_id: int, full_locs: torch.Tensor):
+        try:
+            pool = self.token_to_kv_pool
+            item = pool.layer_mapping[layer_id]
+            mask = (full_locs + 1) % 4 == 0
+            phys = full_locs[mask] // 4
+            cidx = item.compress_layer_id
+            idx_pool = pool.c4_indexer_kv_pool
+            ik = idx_pool.get_index_k(cidx).flatten(0, 1)[phys]
+            ik_sum = self._kv_digest_sum(ik)
+            isc = idx_pool.get_index_scale(cidx).flatten(0, 1)[phys]
+            isc_sum = self._kv_digest_sum(isc)
+            return f"ik={ik_sum};is={isc_sum}"
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
+    def _kv_state_digest(
+        self,
+        layer_id: int,
+        swa_flat: torch.Tensor,
+        ratio: int,
+        req_pool_scalar: torch.Tensor,
+        ntok: int,
+        device,
+    ):
+        try:
+            pool = self.token_to_kv_pool
+            state_pool = pool.get_attention_compress_states(layer_id)
+            if ratio == 4:
+                state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_flat)
+            else:
+                positions = torch.arange(ntok, device=device)
+                state_loc = state_pool.translate_from_req_position_to_state_loc(
+                    req_pool_scalar, positions
+                )
+            state_cache = state_pool.state_cache_3d
+            data = state_cache.flatten(0, 1)[state_loc]
+            return self._kv_digest_sum(data)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
+    def _kv_c128_digest(self, layer_id: int, ntok: int, req_pool_idx: torch.Tensor):
+        # C128 physical slots come from req_to_c128_sidecar, not full_locs//128.
+        try:
+            pool = self.token_to_kv_pool
+            rtp = self.req_to_token_pool
+            c128_ps = rtp.c128_page_size
+            positions = torch.arange(ntok, device=req_pool_idx.device)
+            mask = (positions + 1) % 128 == 0
+            block = positions[mask] // 128
+            page = block // c128_ps
+            offset = block % c128_ps
+            phys_pages = rtp.req_to_c128_sidecar[req_pool_idx, page]
+            phys = phys_pages * c128_ps + offset
+            data = pool.get_compress_buffer(layer_id, False, loc=phys)
+            return self._kv_digest_sum(data)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
+    def _kv_c128_sidecar_digest(self, req_pool_idx: torch.Tensor, ntok: int):
+        try:
+            rtp = self.req_to_token_pool
+            c128_ps = rtp.c128_page_size
+            num_pages = (ntok // 128 + c128_ps - 1) // c128_ps
+            sidecar = rtp.req_to_c128_sidecar[req_pool_idx, :num_pages]
+            return self._kv_digest_sum(sidecar)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
+    def _kv_comp_digest(self, layer_id: int, full_locs: torch.Tensor, ratio: int):
+        try:
+            mask = (full_locs + 1) % ratio == 0
+            phys = full_locs[mask] // ratio
+            data = self.token_to_kv_pool.get_compress_buffer(
+                layer_id, False, loc=phys
+            )
+            return self._kv_digest_sum(data)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
+    def _kv_digest(self, forward_batch, layer_id: int, phase: str) -> None:
+        """Emit [KVSUM] digest lines to server.log (SGLANG_DSV4_KV_DIGEST=1).
+
+        phase=write at extend (populate), phase=read at decode (replay).
+        Comparing write vs read digests reveals whether L3-loaded KV matches
+        what was originally computed.
+        """
+        if not envs.SGLANG_DSV4_KV_DIGEST.get():
+            return
+        if layer_id not in self._kv_digest_layers_resolved():
+            return
+        fb = forward_batch
+        req_pool = getattr(fb, "req_pool_indices", None)
+        seq_lens = getattr(fb, "seq_lens", None)
+        if req_pool is None or seq_lens is None or req_pool.numel() == 0:
+            return
+        num_pad = int(getattr(fb, "num_padding", 0) or 0)
+        real_bs = seq_lens.numel() - num_pad
+        if real_bs <= 0:
+            return
+        rids = getattr(fb, "rids", None)
+        pool = self.token_to_kv_pool
+        req_pool64 = req_pool.to(torch.int64)
+        for b in range(real_bs):
+            ntok = int(seq_lens[b].item())
+            if ntok <= 0:
+                continue
+            rid = (
+                rids[b]
+                if rids is not None and b < len(rids)
+                else f"req{int(req_pool64[b])}"
+            )
+            if phase == "read":
+                key = (rid, layer_id)
+                if key in self._kv_digest_seen:
+                    continue
+                self._kv_digest_seen.add(key)
+            try:
+                full_locs = self.req_to_token[req_pool64[b], :ntok]
+                ratio = pool.layer_mapping[layer_id].compress_ratio
+                swa_sum = state_sum = None
+                try:
+                    swa_flat = pool.translate_loc_from_full_to_swa(full_locs)
+                    swa_sum = self._kv_digest_sum(
+                        pool.get_swa_buffer(layer_id, loc=swa_flat)
+                    )
+                    if ratio in (4, 128):
+                        state_sum = self._kv_state_digest(
+                            layer_id,
+                            swa_flat,
+                            ratio,
+                            req_pool64[b],
+                            ntok,
+                            seq_lens.device,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    if swa_sum is None:
+                        swa_sum = f"ERR:{type(e).__name__}"
+                c4_sum = c128_sum = idx_sum = sidecar_sum = None
+                if ratio == 4:
+                    c4_sum = self._kv_comp_digest(layer_id, full_locs, 4)
+                    idx_sum = self._kv_indexer_digest(layer_id, full_locs)
+                elif ratio == 128:
+                    c128_sum = self._kv_c128_digest(layer_id, ntok, req_pool64[b])
+                    sidecar_sum = self._kv_c128_sidecar_digest(req_pool64[b], ntok)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[KVSUM] phase=%s rid=%s layer=%d ntok=%d err=%s:%s",
+                    phase, rid, layer_id, ntok, type(e).__name__, e,
+                )
+                continue
+            logger.warning(
+                "[KVSUM] phase=%s rid=%s layer=%d ntok=%d swa=%s c4=%s c128=%s "
+                "state=%s idx=%s sidecar=%s",
+                phase, rid, layer_id, ntok,
+                swa_sum, c4_sum, c128_sum, state_sum, idx_sum, sidecar_sum,
+            )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1414,6 +1595,12 @@ class DeepseekV4AscendAttnBackend(
 
         self.forward_metadata = ctx.fm
 
+        # graph decode read-digest: must run here, not in forward() (graph replay
+        # never re-enters forward; .item() host sync illegal during capture).
+        if envs.SGLANG_DSV4_KV_DIGEST.get() and ctx.graph_mode.is_decode():
+            for lid in self._kv_digest_layers_resolved():
+                self._kv_digest(forward_batch, lid, "read")
+
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
@@ -1649,6 +1836,11 @@ class DeepseekV4AscendAttnBackend(
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
+        # extend write-digest: capture what's in the pool after store_cache.
+        # eager decode read-digest is here too; graph decode lives in
+        # _apply_dsv4_graph_metadata to avoid .item() during graph capture.
+        if envs.SGLANG_DSV4_KV_DIGEST.get() and forward_batch.forward_mode.is_extend():
+            self._kv_digest(forward_batch, layer.layer_id, "write")
         if compress_ratio == 0:
             return self._forward_swa(q, layer, forward_batch, attn_sink)
         return self._forward_compressed(
