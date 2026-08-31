@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -329,7 +330,12 @@ class HybridCacheController(BaseHiCacheController):
         if pool_transfers:
             for pool in pool_transfers:
                 if pool.indices_from_pool == PoolName.KV:
-                    self._apply_kv_anchor_ratio(pool, pool.device_indices, pool.host_indices)
+                    pool.device_indices = self._map_kv_derived_indices(
+                        pool.name, pool.device_indices
+                    )
+                    pool.host_indices = self._map_kv_derived_indices(
+                        pool.name, pool.host_indices
+                    )
 
         self.write_queue.append(
             CacheOperation(
@@ -632,6 +638,7 @@ class HybridCacheController(BaseHiCacheController):
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
                         indices_from_pool=transfer.indices_from_pool,
+                        storage_key_span_pages=transfer.storage_key_span_pages,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
@@ -662,6 +669,7 @@ class HybridCacheController(BaseHiCacheController):
                 transfer
                 for transfer in operation.pool_transfers
                 if transfer.indices_from_pool != PoolName.KV
+                and transfer.keys  # skip deferred transfers with no hit groups
             ]
             self._sync_trailing_keys(
                 transfers_nonkv, operation.hash_value, kv_completed_pages
@@ -762,7 +770,9 @@ class HybridCacheController(BaseHiCacheController):
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:
             if transfer.indices_from_pool == PoolName.KV:
-                transfer.host_indices = operation.host_indices
+                transfer.host_indices = self._map_kv_derived_indices(
+                    transfer.name, operation.host_indices
+                )
                 if transfer.keys is None:
                     transfer.keys = operation.hash_value
 
@@ -833,28 +843,154 @@ class HybridCacheController(BaseHiCacheController):
                 )
                 transfer.host_indices = transfer.host_indices[:needed]
 
-    def _apply_kv_anchor_ratio(
-        self,
-        pool: PoolTransfer,
-        device_indices: torch.Tensor,
-        host_indices: torch.Tensor,
-    ) -> None:
-        """Assign KV-anchor indices to pool, scaled by the pool's compression ratio.
-
-        C4/C128 compressed pools derive their token indices from the FULL-pool
-        anchor but use a smaller slot_page_size; the transfer op requires indices
-        already divided by the ratio (page_size // slot_page_size).
-        """
-        entry = self.mem_pool_host.entry_map.get(pool.name)
+    def _map_kv_derived_indices(
+        self, pool_name: PoolName, indices: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if indices is None:
+            return None
+        # NPU compressed pools (C4 / C4 indexer) store their host KV at
+        # their native kernel_page_size (e.g. 32) while inheriting the
+        # FULL anchor's raw-token indices. Convert the FULL indices to the
+        # compressed pool's index space before either host transfer or L3 I/O.
+        entry = self.mem_pool_host.entry_map.get(pool_name)
+        slot_page_size = getattr(
+            getattr(entry, "host_pool", None), "slot_page_size", self.page_size
+        )
         ratio = 1
-        if entry is not None and self.page_size % entry.host_pool.slot_page_size == 0:
-            ratio = self.page_size // entry.host_pool.slot_page_size
+        if slot_page_size > 0 and self.page_size % slot_page_size == 0:
+            ratio = self.page_size // slot_page_size
         if ratio > 1:
-            pool.device_indices = device_indices // ratio
-            pool.host_indices = host_indices // ratio
-        else:
-            pool.device_indices = device_indices
-            pool.host_indices = host_indices
+            return indices.reshape(-1, ratio)[:, 0] // ratio
+        return indices
+
+    def _alloc_deferred_independent_transfers(
+        self,
+        pool_transfers: Optional[list[PoolTransfer]],
+        kv_hit_pages: int,
+    ) -> bool:
+        """Allocate host slots for deferred-alloc independent pools (host_indices=None).
+
+        Called after the FULL host allocation so the exact hit count is known.
+        Computes the number of complete native pages from kv_hit_pages and the
+        pool's storage_key_span_pages, allocates precisely that many slots, and
+        fills transfer.host_indices in place.  Returns False on allocation failure.
+        """
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None:
+                continue
+            span = transfer.storage_key_span_pages
+            if span is None or transfer.indices_from_pool is not None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            page_size = getattr(entry.host_pool, "page_size", 0)
+            if page_size <= 0 or span <= 0:
+                continue
+            num_keys = kv_hit_pages // span
+            if num_keys == 0:
+                # No complete groups fit the hit; leave host_indices=None and
+                # keys=None so _page_transfer_sidecar skips this transfer.
+                transfer.keys = None
+                continue
+            num_slots = num_keys * page_size
+            host_indices = entry.host_pool.alloc(num_slots)
+            if host_indices is None and entry.host_evict_fn is not None:
+                entry.host_evict_fn(num_slots)
+                host_indices = entry.host_pool.alloc(num_slots)
+            if host_indices is None:
+                logger.warning(
+                    "Deferred host alloc failed: pool=%s need=%d slots",
+                    transfer.name,
+                    num_slots,
+                )
+                return False
+            transfer.host_indices = host_indices
+            transfer.keys = (transfer.keys or [])[:num_keys]
+        return True
+
+    def storage_prefetch_alignment(
+        self, pool_transfers: Optional[list[PoolTransfer]]
+    ) -> int:
+        alignment_pages = 1
+        for transfer in pool_transfers or []:
+            span = transfer.storage_key_span_pages
+            if span is not None:
+                if span <= 0:
+                    return 0
+                alignment_pages = math.lcm(alignment_pages, span)
+        return alignment_pages * self.page_size
+
+    def _trim_independent_storage_transfers(
+        self,
+        pool_transfers: Optional[list[PoolTransfer]],
+        kv_hit_pages: int,
+    ) -> bool:
+        """Trim independent-key host buffers to the resolved KV prefix.
+
+        The scheduler calls this after the primary host allocation, before the
+        operation enters the storage-I/O queue. Keeping the mutation on that
+        thread makes trimming atomic with reject/abort cleanup.
+        """
+        plans: list[tuple[PoolTransfer, int, int]] = []
+        valid = True
+        for transfer in pool_transfers or []:
+            span = transfer.storage_key_span_pages
+            if span is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            keys = transfer.keys
+            host_indices = transfer.host_indices
+            page_size = getattr(entry.host_pool, "page_size", 0) if entry else 0
+            if (
+                span <= 0
+                or kv_hit_pages % span != 0
+                or entry is None
+                or page_size <= 0
+                or keys is None
+                or host_indices is None
+                or host_indices.numel() != len(keys) * page_size
+                or kv_hit_pages // span > len(keys)
+            ):
+                logger.error(
+                    "Invalid independent storage transfer geometry for %s: "
+                    "kv_pages=%d span=%s keys=%s indices=%s page_size=%s",
+                    transfer.name,
+                    kv_hit_pages,
+                    span,
+                    len(keys) if keys is not None else None,
+                    host_indices.numel() if host_indices is not None else None,
+                    page_size,
+                )
+                valid = False
+                continue
+            plans.append((transfer, kv_hit_pages // span, page_size))
+
+        if not valid:
+            plans = []
+            for transfer in pool_transfers or []:
+                if transfer.storage_key_span_pages is None:
+                    continue
+                entry = self.mem_pool_host.entry_map.get(transfer.name)
+                page_size = getattr(entry.host_pool, "page_size", 0) if entry else 0
+                plans.append((transfer, 0, page_size))
+
+        for transfer, keep_keys, page_size in plans:
+            keys = transfer.keys or []
+            host_indices = transfer.host_indices
+            keep_slots = keep_keys * page_size
+            if host_indices is not None:
+                tail = host_indices[keep_slots:]
+                if tail.numel() > 0:
+                    self.append_host_mem_release(
+                        extra_pools=[
+                            PoolTransfer(name=transfer.name, host_indices=tail)
+                        ]
+                    )
+                transfer.host_indices = host_indices[:keep_slots]
+            transfer.keys = keys[:keep_keys]
+
+        return valid
 
     def _resolve_device_transfers(
         self,
@@ -903,7 +1039,12 @@ class HybridCacheController(BaseHiCacheController):
         # Assign indices to deferred pools from their source.
         for pool in derived_transfers:
             if pool.indices_from_pool == PoolName.KV:
-                self._apply_kv_anchor_ratio(pool, kv_device_indices, kv_host_indices)
+                pool.host_indices = self._map_kv_derived_indices(
+                    pool.name, kv_host_indices
+                )
+                pool.device_indices = self._map_kv_derived_indices(
+                    pool.name, kv_device_indices
+                )
                 continue
 
             source = next(

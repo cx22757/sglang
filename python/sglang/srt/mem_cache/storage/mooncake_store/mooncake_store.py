@@ -16,10 +16,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    resolve_pool_transfer_hits,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -30,6 +30,20 @@ SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
+
+
+PAGE_PACKED_HYBRID_POOLS = frozenset(
+    {
+        PoolName.INDEXER,
+        PoolName.DRAFT_INDEXER,
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+)
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -792,16 +806,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{pool_name}_k",
                     f"_{self.mha_suffix}_{pool_name}_v",
                 ]
-        elif pool_name in (
-            PoolName.INDEXER,
-            PoolName.DRAFT_INDEXER,
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            PoolName.DEEPSEEK_V4_C128,
-            PoolName.DEEPSEEK_V4_C4_STATE,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-            PoolName.DEEPSEEK_V4_C128_STATE,
-        ):
+        elif pool_name in PAGE_PACKED_HYBRID_POOLS:
             # DSA indexer and DeepSeek V4 side pools are page-packed
             # single-object pools.
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
@@ -839,47 +844,32 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             kv_pages = self.batch_exists(keys, extra_info)
 
-        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
-
+        pool_page_exists: list[list[bool]] = []
         for transfer in pool_transfers or []:
-            if final_pages == 0:
-                break
+            page_keys = (
+                transfer.keys
+                if transfer.storage_key_span_pages is not None
+                else keys
+            )
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                page_keys or [], transfer
             )
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
+            page_count = len(page_keys or [])
             if key_multiplier > 0:
                 page_exists = [
                     all(
                         r == 1
                         for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
                     )
-                    for i in range(kv_pages)
+                    for i in range(page_count)
                 ]
             else:
-                page_exists = [False] * kv_pages
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-            if boundary:
-                hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+                page_exists = [False] * page_count
+            pool_page_exists.append(page_exists)
 
-        return PoolTransferResult(final_pages, hit_count)
+        return resolve_pool_transfer_hits(kv_pages, pool_transfers, pool_page_exists)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
@@ -891,7 +881,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
-            assert len(keys) == len(host_indices) // page_size
+            if len(host_indices) % page_size != 0:
+                raise ValueError(
+                    f"Mooncake hybrid pool {transfer.name} has incomplete native "
+                    f"pages: indices={len(host_indices)}, page_size={page_size}"
+                )
+            native_page_count = len(host_indices) // page_size
+            if transfer.name in PAGE_PACKED_HYBRID_POOLS:
+                if native_page_count % len(keys) != 0:
+                    raise ValueError(
+                        f"Mooncake page-packed pool {transfer.name} cannot map "
+                        f"{native_page_count} native pages to {len(keys)} logical keys"
+                    )
+            elif native_page_count != len(keys):
+                raise ValueError(
+                    f"Mooncake hybrid pool {transfer.name} key/page mismatch: "
+                    f"keys={len(keys)}, native_pages={native_page_count}"
+                )
 
             tagged_keys = self._tag_keys(keys)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
@@ -899,7 +905,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
+            if transfer.name in PAGE_PACKED_HYBRID_POOLS:
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )

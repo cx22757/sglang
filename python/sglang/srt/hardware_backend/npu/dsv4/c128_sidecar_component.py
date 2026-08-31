@@ -17,12 +17,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
+    FreeComponentHostSlot,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -31,8 +33,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     EvictLayer,
     PrepareLoadBackResult,
+    PreparePrefetchResult,
     TreeComponent,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -311,6 +315,18 @@ class C128SidecarComponent(TreeComponent):
             for page_ids in action.indices:
                 self.allocator.release_c128_pages(page_ids)
             return
+        if isinstance(action, FreeComponentHostSlot):
+            for host_indices in action.host_indices:
+                if host_indices is not None and host_indices.numel() > 0:
+                    self.cache.cache_controller.append_host_mem_release(
+                        extra_pools=[
+                            PoolTransfer(
+                                name=PoolName.DEEPSEEK_V4_C128,
+                                host_indices=host_indices,
+                            )
+                        ]
+                    )
+            return
         raise AssertionError(
             f"C128SidecarComponent: unhandled action {type(action).__name__}"
         )
@@ -358,6 +374,37 @@ class C128SidecarComponent(TreeComponent):
             self._c128_kv_pool_host.free(host_value)
 
     # ---- HiCache Hooks ----
+
+    def _storage_geometry(self) -> tuple[int, int, int]:
+        page_size = self.allocator.c128_attn_allocator.page_size
+        group_tokens = 128 * page_size
+        full_page_size = self.tree_core.page_size
+        assert group_tokens % full_page_size == 0, (
+            f"C128 group size {group_tokens} must align to Full page size "
+            f"{full_page_size}"
+        )
+        return page_size, group_tokens, group_tokens // full_page_size
+
+    def prepare_prefetch(
+        self,
+        node_id: int,
+        *,
+        prefetch_tokens: int = 0,
+    ) -> PreparePrefetchResult:
+        if self._c128_kv_pool_host is None:
+            return PreparePrefetchResult()
+
+        _, group_tokens, _ = self._storage_geometry()
+        anchor = self.tree_core.node_by_id(node_id)
+        assert self._node_depth(anchor) % group_tokens == 0
+        num_groups = prefetch_tokens // group_tokens
+        if num_groups == 0:
+            return PreparePrefetchResult()
+
+        # Signal that build_hicache_transfers should be called with host_indices=None;
+        # actual allocation is deferred to _try_alloc_storage_hit once the real hit
+        # count is known, avoiding pre-alloc → align → trim waste.
+        return PreparePrefetchResult(host_indices=None, deferred_alloc=True)
 
     @staticmethod
     def _expand_page_indices(page_ids: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -426,8 +473,136 @@ class C128SidecarComponent(TreeComponent):
                 )
             ]
 
-        # BACKUP_STORAGE / PREFETCH are deferred to Plan-3.
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None or not node.hash_value:
+                return None
+            _, group_tokens, span_pages = self._storage_geometry()
+            assert self._node_depth(node) % group_tokens == 0
+            assert cd.host_value.numel() == page_size, (
+                "Each C128 boundary must own exactly one complete host page: "
+                f"got {cd.host_value.numel()}, expected {page_size}"
+            )
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_indices=cd.host_value,
+                    keys=[node.hash_value[-1]],
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                    indices_from_pool=None,
+                    storage_key_span_pages=span_pages,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            assert token_ids is not None
+            _, group_tokens, span_pages = self._storage_geometry()
+            assert self._node_depth(node) % group_tokens == 0
+            full_hashes = get_hash_str(
+                list(token_ids), last_hash, page_size=self.tree_core.page_size
+            )
+            assert isinstance(full_hashes, list)
+            keys = full_hashes[span_pages - 1 :: span_pages]
+            expected_groups = prefetch_tokens // group_tokens
+            assert len(keys) == expected_groups
+            if host_indices is not None:
+                assert host_indices.numel() == len(keys) * page_size, (
+                    f"C128 prefetch geometry mismatch: indices={host_indices.numel()} "
+                    f"keys={len(keys)} page_size={page_size}"
+                )
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_indices=host_indices,
+                    keys=keys,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                    indices_from_pool=None,
+                    storage_key_span_pages=span_pages,
+                )
+            ]
+
         return None
+
+    def _release_c128_host(
+        self,
+        host_indices: Optional[torch.Tensor],
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        if host_indices is not None and host_indices.numel() > 0:
+            cache_actions.append(
+                FreeComponentHostSlot(
+                    [host_indices], component_type=ComponentType.C128
+                )
+            )
+
+    def _attach_c128_host_value(
+        self, node: UnifiedTreeNode, host_indices: torch.Tensor
+    ) -> None:
+        ct = self.component_type
+        cd = node.component_data[ct]
+        assert cd.host_value is None
+        cd.host_value = host_indices.clone()
+        host_lru = self.tree_core.host_lru_lists[ct]
+        if cd.value is None and not host_lru.in_list(node):
+            host_lru.insert_mru(node)
+        self.tree_core._update_evictable_leaf_sets(node)
+        if node.parent is not None:
+            self.tree_core._update_evictable_leaf_sets(node.parent)
+
+    def _commit_prefetch(
+        self,
+        anchor: UnifiedTreeNode,
+        transfers: list[PoolTransfer],
+        *,
+        cache_actions: list[CacheAction | ComponentAction],
+        insert_result: Optional[InsertResult],
+        pool_storage_result: Optional[PoolTransferResult],
+    ) -> None:
+        if not transfers:
+            return
+
+        xfer = transfers[0]
+        host_indices = xfer.host_indices
+        keys = xfer.keys or []
+        page_size, group_tokens, _ = self._storage_geometry()
+        required_groups = len(keys)
+        loaded_groups = (
+            pool_storage_result.extra_pool_hit_pages.get(
+                PoolName.DEEPSEEK_V4_C128, 0
+            )
+            if pool_storage_result is not None
+            else 0
+        )
+        target = (
+            self.tree_core.node_by_id(insert_result.inserted_host_node)
+            if insert_result is not None
+            and insert_result.inserted_host_node is not None
+            else None
+        )
+        if (
+            target is None
+            or host_indices is None
+            or required_groups == 0
+            or host_indices.numel() != required_groups * page_size
+            or loaded_groups < required_groups
+            or insert_result.total_len != required_groups * group_tokens
+        ):
+            self._release_c128_host(host_indices, cache_actions)
+            return
+
+        anchor_depth = self._node_depth(anchor)
+        assert anchor_depth % group_tokens == 0
+        for group_idx in range(required_groups):
+            boundary = anchor_depth + (group_idx + 1) * group_tokens
+            boundary_node = self._ensure_boundary_node(
+                target, boundary, cache_actions
+            )
+            start = group_idx * page_size
+            slice_ = host_indices[start : start + page_size]
+            if boundary_node.component_data[self.component_type].host_value is None:
+                self._attach_c128_host_value(boundary_node, slice_)
+            else:
+                self._release_c128_host(slice_, cache_actions)
 
     def commit_hicache_transfer(
         self,
@@ -476,4 +651,14 @@ class C128SidecarComponent(TreeComponent):
                 self.allocator.retain_c128_pages(page_ids)
                 self.tree_core.set_component_device_value(nid, ct, page_ids.clone())
                 offset += n_len
+            return
+
+        if phase == CacheTransferPhase.PREFETCH:
+            self._commit_prefetch(
+                node,
+                transfers,
+                cache_actions=cache_actions,
+                insert_result=insert_result,
+                pool_storage_result=pool_storage_result,
+            )
             return

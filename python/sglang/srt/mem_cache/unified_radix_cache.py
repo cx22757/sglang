@@ -1787,7 +1787,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if prep.alloc_failed:
                 alloc_failed = True
                 break
-            if prep.host_indices is None:
+            if prep.host_indices is None and not prep.deferred_alloc:
                 continue
             transfers = self.tree_core.build_hicache_transfers(
                 ct,
@@ -2341,13 +2341,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.evict_host(alloc_len)
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None and not buffer_mode:
-                # Memory-pressure fallback: a shorter page-aligned prefix.
-                # (Cache mode only — buffer mode parks for the full hit.)
+                # Memory-pressure fallback: shorten without crossing any
+                # independent storage-key endpoint (for C128, one group).
+                alignment = cc.storage_prefetch_alignment(operation.pool_transfers)
                 available_size = cc.mem_pool_host.available_size()
-                alloc_len = min(
-                    operation.storage_hit_count,
-                    available_size - (available_size % self.page_size),
-                )
+                alloc_len = min(operation.storage_hit_count, available_size)
+                if alignment > 0:
+                    alloc_len -= alloc_len % alignment
+                else:
+                    alloc_len = 0
                 if alloc_len >= self.prefetch_threshold:
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
@@ -2356,6 +2358,29 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.revoke_pending_prefetch(req_id)
                 return True
 
+            kv_hit_pages = alloc_len // self.page_size
+
+            # For non-KV-derived independent pools (e.g. C128) that opted for
+            # deferred allocation, allocate exactly the hit-sized slots now.
+            if not cc._alloc_deferred_independent_transfers(
+                operation.pool_transfers, kv_hit_pages
+            ):
+                cc.mem_pool_host.free(host_indices)
+                if buffer_mode:
+                    return False
+                self.revoke_pending_prefetch(req_id)
+                return True
+
+            # For non-KV-derived independent pools that were pre-allocated,
+            # trim the tail beyond the resolved hit boundary.
+            if not cc._trim_independent_storage_transfers(
+                operation.pool_transfers, kv_hit_pages
+            ):
+                cc.mem_pool_host.free(host_indices)
+                if buffer_mode:
+                    return False
+                self.revoke_pending_prefetch(req_id)
+                return True
             operation.storage_hit_count = alloc_len
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices

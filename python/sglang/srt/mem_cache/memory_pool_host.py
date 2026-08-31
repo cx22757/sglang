@@ -718,23 +718,39 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def get_page_buffer_meta(self, indices):
         ptr_list = []
+        size_list = []
         rows = self._to_page_indices(indices).tolist()
+
+        has_scale = self.scale_item_bytes > 0 and self.scale_kv_buffer is not None
         if self.layout == "layer_first":
+            k_elem = self.item_bytes * self.dtype.itemsize
             for row in rows:
                 page_index = int(row)
                 for layer_id in range(self.layer_num):
-                    ptr = (
+                    ptr_list.append(
                         self.kv_buffer[layer_id].data_ptr()
-                        + page_index * self.item_bytes * self.dtype.itemsize
+                        + page_index * k_elem
                     )
-                    ptr_list.append(ptr)
-            element_size = self.item_bytes * self.dtype.itemsize
-            return ptr_list, [element_size] * len(ptr_list)
+                    size_list.append(k_elem)
+                if has_scale:
+                    for layer_id in range(self.layer_num):
+                        ptr_list.append(
+                            self.scale_kv_buffer[layer_id].data_ptr()
+                            + page_index * self.scale_item_bytes
+                        )
+                        size_list.append(self.scale_item_bytes)
+            return ptr_list, size_list
         if self.layout in ["page_first", "page_first_direct"]:
             page_bytes = self.layer_num * self.item_bytes * self.dtype.itemsize
             for row in rows:
-                ptr_list.append(self.kv_buffer[int(row)].data_ptr())
-            return ptr_list, [page_bytes] * len(ptr_list)
+                page_index = int(row)
+                ptr_list.append(self.kv_buffer[page_index].data_ptr())
+                size_list.append(page_bytes)
+                if has_scale:
+                    scale_page = self.scale_kv_buffer[page_index]
+                    ptr_list.append(scale_page.data_ptr())
+                    size_list.append(scale_page.numel() * self.dtype.itemsize)
+            return ptr_list, size_list
         raise ValueError(f"Unsupported layout: {self.layout}")
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:

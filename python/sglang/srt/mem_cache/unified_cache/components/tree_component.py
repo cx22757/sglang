@@ -79,6 +79,9 @@ class PreparePrefetchResult:
     alloc_failed: bool = False
     # The component's pre-allocated host buffer (None = skip the build).
     host_indices: Optional[torch.Tensor] = None
+    # True when the component intentionally defers host allocation to hit-alloc
+    # time; build_hicache_transfers is still called with host_indices=None.
+    deferred_alloc: bool = False
 
 
 class CacheTransferPhase(str, Enum):

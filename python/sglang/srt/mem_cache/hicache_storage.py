@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -107,6 +108,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # None keeps the legacy Full-page key coordinates. A positive value means
+    # `keys` belongs to this pool and each key closes this many primary KV pages.
+    storage_key_span_pages: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +151,90 @@ class PoolTransferResult:
         start, so count the leading run of successes
         """
         self.extra_pool_hit_pages.update(results)
+
+
+def resolve_pool_transfer_hits(
+    kv_hit_pages: int,
+    pool_transfers: Optional[List[PoolTransfer]],
+    pool_page_exists: List[List[bool]],
+) -> PoolTransferResult:
+    """Resolve a common primary-KV prefix from per-pool existence bitmaps.
+
+    Legacy transfers use one bitmap entry per primary KV page. Independent-key
+    transfers use one entry per native pool page and declare how many primary
+    pages each entry closes through ``storage_key_span_pages``. Trailing pools
+    are evaluated only after all ALL_PAGES pools establish the endpoint
+    alignment, so a later independent-pool clamp cannot invalidate an earlier
+    trailing-state check.
+    """
+    transfers = pool_transfers or []
+    if len(transfers) != len(pool_page_exists):
+        raise ValueError(
+            "pool transfer/existence count mismatch: "
+            f"{len(transfers)} != {len(pool_page_exists)}"
+        )
+
+    hit_count: dict[str, int] = {PoolName.KV: kv_hit_pages} if kv_hit_pages else {}
+    final_pages = kv_hit_pages
+    endpoint_alignment = 1
+    trailing: list[tuple[PoolTransfer, List[bool]]] = []
+
+    for transfer, exists in zip(transfers, pool_page_exists):
+        span = transfer.storage_key_span_pages
+        if span is not None:
+            if span <= 0:
+                raise ValueError(
+                    f"storage_key_span_pages must be positive for {transfer.name}"
+                )
+            if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                raise ValueError(
+                    "Independent storage keys currently require ALL_PAGES: "
+                    f"{transfer.name} uses {transfer.hit_policy}"
+                )
+            endpoint_alignment = math.lcm(endpoint_alignment, span)
+            required_groups = min(len(exists), kv_hit_pages // span)
+            native_hits = next(
+                (i for i in range(required_groups) if not exists[i]),
+                required_groups,
+            )
+            if native_hits:
+                hit_count[transfer.name] = native_hits
+            final_pages = min(final_pages, native_hits * span)
+            continue
+
+        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            trailing.append((transfer, exists))
+            continue
+
+        boundary = next(
+            (i for i in range(min(kv_hit_pages, len(exists))) if not exists[i]),
+            min(kv_hit_pages, len(exists)),
+        )
+        if boundary:
+            hit_count[transfer.name] = boundary
+        final_pages = min(final_pages, boundary)
+
+    final_pages -= final_pages % endpoint_alignment
+
+    if trailing and final_pages:
+        selected = 0
+        for candidate in range(final_pages, 0, -endpoint_alignment):
+            all_present = True
+            for transfer, exists in trailing:
+                trailing_pages = max(1, len(transfer.keys) if transfer.keys else 1)
+                start = max(0, candidate - trailing_pages)
+                if candidate > len(exists) or not all(exists[start:candidate]):
+                    all_present = False
+                    break
+            if all_present:
+                selected = candidate
+                break
+        final_pages = selected
+        if selected:
+            for transfer, _ in trailing:
+                hit_count[transfer.name] = selected
+
+    return PoolTransferResult(final_pages, hit_count)
 
 
 def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
@@ -585,7 +673,12 @@ class HiCacheFile(HiCacheStorage):
     ) -> Set[str]:
         target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
         for transfer in pool_transfers or []:
-            for key in keys:
+            component_keys = (
+                transfer.keys
+                if transfer.storage_key_span_pages is not None
+                else keys
+            )
+            for key in component_keys or []:
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
         if self.metadata_cache is None:
@@ -616,11 +709,6 @@ class HiCacheFile(HiCacheStorage):
     ) -> PoolTransferResult:
         existing_files = self._collect_existing_component_keys(keys, pool_transfers)
 
-        def has_component(page_idx: int, name: str) -> bool:
-            return (
-                f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
-            )
-
         # Longest contiguous KV prefix present in storage.
         kv_pages = next(
             (
@@ -631,32 +719,22 @@ class HiCacheFile(HiCacheStorage):
             len(keys),
         )
 
-        hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
-
+        pool_page_exists: list[list[bool]] = []
         for transfer in pool_transfers or []:
-            if final_pages == 0:
-                break
-            name = transfer.name
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                boundary = next(
-                    (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
-                )
-            else:  # trailing_pages
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                boundary = 0
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        has_component(i, name)
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-            if boundary:
-                hit_count[name] = boundary
-            final_pages = min(final_pages, boundary)
+            component_keys = (
+                transfer.keys
+                if transfer.storage_key_span_pages is not None
+                else keys
+            )
+            pool_page_exists.append(
+                [
+                    f"{self._get_component_key(key, transfer.name)}.bin"
+                    in existing_files
+                    for key in component_keys or []
+                ]
+            )
 
-        return PoolTransferResult(final_pages, hit_count)
+        return resolve_pool_transfer_hits(kv_pages, pool_transfers, pool_page_exists)
 
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
