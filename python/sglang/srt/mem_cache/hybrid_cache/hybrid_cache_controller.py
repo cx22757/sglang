@@ -859,7 +859,9 @@ class HybridCacheController(BaseHiCacheController):
         ratio = 1
         if slot_page_size > 0 and self.page_size % slot_page_size == 0:
             ratio = self.page_size // slot_page_size
-        return indices // ratio if ratio > 1 else indices
+        if ratio > 1:
+            return indices.reshape(-1, ratio)[:, 0] // ratio
+        return indices
 
     def _alloc_deferred_independent_transfers(
         self,
