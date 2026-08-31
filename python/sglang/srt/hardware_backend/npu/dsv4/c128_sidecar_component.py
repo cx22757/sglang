@@ -21,8 +21,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
+    FreeComponentHostSlot,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     EvictLayer,
     PrepareLoadBackResult,
+    PreparePrefetchResult,
     TreeComponent,
 )
 
@@ -141,19 +144,67 @@ class C128SidecarComponent(TreeComponent):
             return result
 
         pages = self._collect_device_pages(result.best_match_node)
+        root = self.tree_core.root_node
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        # The scheduler's device prefix after init_load_back is the original
+        # device_indices PLUS the FULL device values on [best_match_node,
+        # last_device_node) (rebuild via collect_full_device_indices). The SWA
+        # device-only validator can gate device_indices to fewer groups than the
+        # FULL device coverage (SWA is evicted independently of FULL), so the
+        # expected C128 page count must use that reconstructed coverage, not
+        # device_indices alone (which is 0 in that mixed state).
+        # Accumulate raw tokens first, divide once at the end (a premature
+        # `// group_tokens` then a raw-token addition mixes units and a second
+        # division double-floors the result).
+        expected_tokens = len(result.device_indices)
+        n = self.tree_core.node_by_id(result.best_match_node)
+        stop = self.tree_core.node_by_id(result.last_device_node)
+        while n is not stop and n is not root:
+            fv = n.component_data[BASE_COMPONENT_TYPE].value
+            if fv is not None:
+                expected_tokens += len(fv)
+            n = n.parent
+        expected = expected_tokens // group_tokens
+        assert pages.numel() == expected, (
+            f"c128 pages={pages.numel()} != expected={expected} "
+            f"(best_match={result.best_match_node} "
+            f"last_device={result.last_device_node} "
+            f"dev_indices_len={len(result.device_indices)})"
+        )
         self.cache.req_to_token_pool.set_c128_prefix_pages(req, pages)
         return result
 
+    def prepare_load_back(
+        self,
+        node_id: int,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        # match_prefix runs before H->D and therefore can only bind the C128
+        # pages that were already device-resident. Remember the anchor so the
+        # successful load-back can replace that provisional mapping.
+        return PrepareLoadBackResult(
+            anchor_node_id=node_id if req is not None else None
+        )
+
     def finalize_load_back(
-        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
+        self,
+        req: Optional[Req],
+        prep: PrepareLoadBackResult,
+        success: bool,
     ) -> None:
-        if not success or req is None:
+        if not success or req is None or prep.anchor_node_id is None:
             return
 
-        # match_prefix runs before load-back, so a host-only C128 endpoint is
-        # absent from the request-local page table built by the match finalizer.
-        # Refresh it after commit_load_back attaches the restored page to the tree.
-        pages = self._collect_device_pages(req.best_match_node)
+        pages = self._collect_device_pages(prep.anchor_node_id)
+        _, group_tokens, _ = self._storage_geometry()
+        expected = self._node_depth(
+            self.tree_core.node_by_id(prep.anchor_node_id)
+        ) // group_tokens
+        assert pages.numel() == expected, (
+            f"c128 load-back pages={pages.numel()} != expected={expected} "
+            f"(anchor={prep.anchor_node_id})"
+        )
         self.cache.req_to_token_pool.set_c128_prefix_pages(req, pages)
 
     def recover_after_unevict(
@@ -311,6 +362,11 @@ class C128SidecarComponent(TreeComponent):
             for page_ids in action.indices:
                 self.allocator.release_c128_pages(page_ids)
             return
+        if isinstance(action, FreeComponentHostSlot):
+            if self._c128_kv_pool_host is not None:
+                for host_indices in action.host_indices:
+                    self._c128_kv_pool_host.free(host_indices)
+            return
         raise AssertionError(
             f"C128SidecarComponent: unhandled action {type(action).__name__}"
         )
@@ -358,6 +414,70 @@ class C128SidecarComponent(TreeComponent):
             self._c128_kv_pool_host.free(host_value)
 
     # ---- HiCache Hooks ----
+
+    def _storage_geometry(self) -> tuple[int, int, int]:
+        slot_page_size = self.allocator.c128_attn_allocator.page_size
+        group_tokens = 128 * slot_page_size
+        anchor_page_size = self.tree_core.page_size
+        if group_tokens % anchor_page_size != 0:
+            raise ValueError(
+                "C128 group tokens must be divisible by the FULL page size: "
+                f"group_tokens={group_tokens}, full_page_size={anchor_page_size}."
+            )
+        return slot_page_size, group_tokens, group_tokens // anchor_page_size
+
+    def align_storage_prefetch_length(
+        self, node: UnifiedTreeNode, prefetch_tokens: int
+    ) -> int:
+        """Keep L3 recovery on complete absolute C128 group boundaries."""
+        _, group_tokens, _ = self._storage_geometry()
+        if self._node_depth(node) % group_tokens != 0:
+            return 0
+        return prefetch_tokens - prefetch_tokens % group_tokens
+
+    def prepare_prefetch(
+        self,
+        node_id,
+        *,
+        prefetch_tokens: int = 0,
+    ) -> PreparePrefetchResult:
+        if self._c128_kv_pool_host is None:
+            return PreparePrefetchResult()
+        page_size, group_tokens, _ = self._storage_geometry()
+        groups = prefetch_tokens // group_tokens
+        need_slots = groups * page_size
+        if need_slots == 0:
+            # A non-None empty tensor still builds a C128 transfer. Its exists
+            # result clamps a sub-group L3 prefix to zero instead of falsely
+            # publishing FULL/C4 data without the required C128 representation.
+            return PreparePrefetchResult(host_indices=torch.empty(0, dtype=torch.int64))
+        host_indices = self._c128_kv_pool_host.alloc(need_slots)
+        if host_indices is None:
+            self.cache.evict_host(need_slots * 128, ComponentType.FULL)
+            host_indices = self._c128_kv_pool_host.alloc(need_slots)
+        if host_indices is None:
+            return PreparePrefetchResult(alloc_failed=True)
+        return PreparePrefetchResult(host_indices=host_indices)
+
+    def _storage_endpoint_keys(
+        self, node: UnifiedTreeNode, groups: int, coverage: int
+    ) -> list[str]:
+        if groups == 0:
+            return []
+        hashes = list(node.hash_value or [])
+        node_end_pages = self._node_depth(node) // self.tree_core.page_size
+        node_start_pages = node_end_pages - len(hashes)
+        endpoints = [
+            page_hash
+            for offset, page_hash in enumerate(hashes, start=1)
+            if (node_start_pages + offset) % coverage == 0
+        ]
+        if len(endpoints) < groups:
+            raise ValueError(
+                f"C128 node {node.id} has {groups} host groups but only "
+                f"{len(endpoints)} endpoint hashes."
+            )
+        return endpoints[-groups:]
 
     @staticmethod
     def _expand_page_indices(page_ids: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -426,7 +546,65 @@ class C128SidecarComponent(TreeComponent):
                 )
             ]
 
-        # BACKUP_STORAGE / PREFETCH are deferred to Plan-3.
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            host_value = node.component_data[ct].host_value
+            if host_value is None:
+                return None
+            if host_value.numel() % page_size != 0:
+                raise ValueError(
+                    f"C128 host value on node {node.id} is not page aligned: "
+                    f"slots={host_value.numel()}, page_size={page_size}."
+                )
+            groups = host_value.numel() // page_size
+            _, _, coverage = self._storage_geometry()
+            keys = self._storage_endpoint_keys(node, groups, coverage)
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_indices=host_value,
+                    keys=keys,
+                    indices_from_pool=None,
+                    nodes_to_load=[node.id],
+                    logical_pages_per_object=coverage,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            assert host_indices is not None
+            if host_indices.numel() % page_size != 0:
+                raise ValueError(
+                    "C128 prefetch host indices are not physical-page aligned: "
+                    f"slots={host_indices.numel()}, page_size={page_size}."
+                )
+            groups = host_indices.numel() // page_size
+            _, _, coverage = self._storage_geometry()
+            hashes = get_hash_str(
+                list(token_ids or []), last_hash, page_size=self.tree_core.page_size
+            )
+            if not isinstance(hashes, list):
+                raise TypeError("C128 storage prefetch requires page hash values.")
+            if len(hashes) != prefetch_tokens // self.tree_core.page_size:
+                raise ValueError(
+                    "C128 prefetch hash/token cardinality mismatch: "
+                    f"hashes={len(hashes)}, prefetch_tokens={prefetch_tokens}, "
+                    f"anchor_page_size={self.tree_core.page_size}."
+                )
+            keys = [hashes[i - 1] for i in range(coverage, len(hashes) + 1, coverage)]
+            if len(keys) != groups:
+                raise ValueError(
+                    "C128 prefetch key/host-group cardinality mismatch: "
+                    f"keys={len(keys)}, groups={groups}."
+                )
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_indices=host_indices,
+                    keys=keys,
+                    indices_from_pool=None,
+                    logical_pages_per_object=coverage,
+                )
+            ]
+
         return None
 
     def commit_hicache_transfer(
@@ -476,4 +654,75 @@ class C128SidecarComponent(TreeComponent):
                 self.allocator.retain_c128_pages(page_ids)
                 self.tree_core.set_component_device_value(nid, ct, page_ids.clone())
                 offset += n_len
+            return
+
+        if phase == CacheTransferPhase.PREFETCH:
+            if not transfers:
+                return
+            xfer = transfers[0]
+            host_indices = xfer.host_indices
+            loaded_groups = (
+                pool_storage_result.extra_pool_hit_pages.get(
+                    PoolName.DEEPSEEK_V4_C128, 0
+                )
+                if pool_storage_result is not None
+                else 0
+            )
+            required_groups = (
+                host_indices.numel() // page_size if host_indices is not None else 0
+            )
+            target = (
+                self.tree_core.node_by_id(insert_result.inserted_host_node)
+                if insert_result is not None
+                and insert_result.inserted_host_node is not None
+                else None
+            )
+            if (
+                target is None
+                or required_groups == 0
+                or loaded_groups < required_groups
+            ):
+                if host_indices is not None and host_indices.numel() > 0:
+                    cache_actions.append(
+                        FreeComponentHostSlot(
+                            [host_indices], component_type=ComponentType.C128
+                        )
+                    )
+                return
+
+            _, group_tokens, _ = self._storage_geometry()
+            anchor_depth = self._node_depth(node)
+            if anchor_depth % group_tokens != 0:
+                cache_actions.append(
+                    FreeComponentHostSlot(
+                        [host_indices], component_type=ComponentType.C128
+                    )
+                )
+                raise ValueError(
+                    f"C128 prefetch anchor depth {anchor_depth} is not aligned "
+                    f"to group_tokens={group_tokens}."
+                )
+
+            for group_idx in range(required_groups):
+                start = group_idx * page_size
+                page_slice = host_indices[start : start + page_size]
+                boundary = anchor_depth + (group_idx + 1) * group_tokens
+                boundary_node = self._ensure_boundary_node(
+                    target, boundary, cache_actions
+                )
+                cd = boundary_node.component_data[ct]
+                if cd.host_value is not None:
+                    cache_actions.append(
+                        FreeComponentHostSlot(
+                            [page_slice], component_type=ComponentType.C128
+                        )
+                    )
+                    continue
+                cd.host_value = page_slice.clone()
+                host_lru = self.tree_core.host_lru_lists[ct]
+                if cd.value is None and not host_lru.in_list(boundary_node):
+                    host_lru.insert_mru(boundary_node)
+                self.tree_core._update_evictable_leaf_sets(boundary_node)
+                if boundary_node.parent is not None:
+                    self.tree_core._update_evictable_leaf_sets(boundary_node.parent)
             return

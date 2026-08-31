@@ -534,3 +534,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         refcount = getattr(self, "c128_page_refcount", None)
         if refcount is not None:
             refcount.zero_()
+        get_kvcache = getattr(self, "get_kvcache", None)
+        if get_kvcache is not None:
+            kvcache = get_kvcache()
+            clear_states = getattr(kvcache, "clear_all_c128_req_states", None)
+            if clear_states is not None:
+                clear_states()

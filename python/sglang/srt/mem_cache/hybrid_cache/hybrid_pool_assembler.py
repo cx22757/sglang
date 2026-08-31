@@ -48,6 +48,14 @@ def _get_allocator_type() -> str:
     return get_allocator_type()
 
 
+def _dsv4_host_pin_memory(
+    storage_backend: Optional[str], storage_backend_extra_config: Optional[dict]
+) -> bool:
+    """Keep NPU-pinned L2 except when MemFabric must register it for RoCE."""
+    protocol = str((storage_backend_extra_config or {}).get("protocol", "")).lower()
+    return not (storage_backend == "ascend_memcache" and protocol == "device_rdma")
+
+
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
@@ -458,6 +466,9 @@ def build_deepseek_v4_hicache_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
+    host_pin_memory = _dsv4_host_pin_memory(
+        storage_backend, storage_backend_extra_config
+    )
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
@@ -545,6 +556,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=swa_num_host_pages,
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
+            pin_memory=host_pin_memory,
             allocator_type=_get_allocator_type(),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -577,6 +589,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=c4_slot_page_size,
             layout=get_memory().hicache_mem_layout,
+            pin_memory=host_pin_memory,
             allocator_type=_get_allocator_type(),
         )
         # NPU stores C4 int8 K and fp16 scale separately; GPU packs both.
@@ -596,6 +609,7 @@ def build_deepseek_v4_hicache_stack(
                 num_host_pages=num_host_pages,
                 slot_page_size=_kp,
                 layout=get_memory().hicache_mem_layout,
+                pin_memory=host_pin_memory,
                 allocator_type=_get_allocator_type(),
             )
             c4_indexer_host_pool.attach_scale_buffers(_s_buf, scale_item_bytes=_s_item_bytes)
@@ -610,6 +624,7 @@ def build_deepseek_v4_hicache_stack(
                 num_host_pages=num_host_pages,
                 slot_page_size=page_size,
                 layout=get_memory().hicache_mem_layout,
+                pin_memory=host_pin_memory,
                 allocator_type=_get_allocator_type(),
             )
         entries.extend(
@@ -641,6 +656,7 @@ def build_deepseek_v4_hicache_stack(
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
+                pin_memory=host_pin_memory,
                 allocator_type=_get_allocator_type(),
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
@@ -652,6 +668,7 @@ def build_deepseek_v4_hicache_stack(
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
+                pin_memory=host_pin_memory,
                 allocator_type=_get_allocator_type(),
             )
             entries.extend(
@@ -692,6 +709,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=c128_num_host_pages,
             slot_page_size=c128_slot_page_size,
             layout=get_memory().hicache_mem_layout,
+            pin_memory=host_pin_memory,
             allocator_type=_get_allocator_type(),
         )
         # C128 state pool is intentionally not registered with hicache.
@@ -1158,6 +1176,7 @@ def build_swa_draft_pools(
             num_host_pages=target_swa_host_pool.num_host_pages,
             slot_page_size=draft_swa_pool.page_size,
             layout=target_swa_host_pool.layout,
+            pin_memory=target_swa_host_pool.pin_memory,
             allocator_type=_get_allocator_type(),
         )
     else:

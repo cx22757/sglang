@@ -56,7 +56,10 @@ def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.T
     return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
 
 
-def _build_explicit_state_block_table(
+_COMPRESSOR_CACHE_MODE = 1
+
+
+def _build_paged_state_block_table(
     *,
     compress_ratio: int,
     coff: int,
@@ -69,18 +72,28 @@ def _build_explicit_state_block_table(
     seqused: torch.Tensor,
     max_input_capacity: int,
 ) -> torch.Tensor:
-    """Adapt GPU-style state locations to the A3 cache_mode=2 table ABI."""
+    """Build the paged state table required by ``cache_mode=1``.
+
+    The Ascend Compressor indexes this table with the global raw-token block
+    number. C4 state blocks follow SWA pages while C128 state blocks follow the
+    request slot. Physical block 0 is reserved by the operator as an invalid
+    entry, so :class:`NPUCompressStatePool` returns strictly-positive locations
+    for valid state.
+    """
     req_pool_indices = req_pool_indices.to(torch.int64)
     capacities = cu_seqlens[1:] - cu_seqlens[:-1]
-    history_size = coff * compress_ratio
-    width = history_size + max_input_capacity
-    columns = torch.arange(width, dtype=torch.int64, device=req_to_token.device)
-    positions = start_pos[:, None] - history_size + columns
-    within_capacity = columns[None, :] < history_size + capacities[:, None]
-    valid = (seqused[:, None] > 0) & within_capacity & (positions >= 0)
+    block_size = state_pool.page_size
+    max_blocks = (req_to_token.shape[1] + block_size - 1) // block_size
+    positions = (
+        torch.arange(max_blocks, dtype=torch.int64, device=req_to_token.device)
+        * block_size
+    )
+    positions = positions[None, :].expand(req_pool_indices.numel(), -1)
+    seq_ends = start_pos.to(torch.int64) + capacities.to(torch.int64)
+    valid = (seqused[:, None] > 0) & (positions < seq_ends[:, None])
 
     if compress_ratio == 4:
-        # Masked history/ragged columns are still indexed before torch.where.
+        # Masked future columns are still indexed before torch.where.
         safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
         full_locs = req_to_token[req_pool_indices[:, None], safe_positions]
         swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(full_locs)
@@ -92,8 +105,8 @@ def _build_explicit_state_block_table(
 
     return torch.where(
         valid,
-        state_locs.to(torch.int32),
-        state_pool.dummy_state_loc,
+        torch.div(state_locs, block_size, rounding_mode="floor").to(torch.int32),
+        0,
     ).contiguous()
 
 
@@ -375,7 +388,7 @@ class CompressorAscendBackendMixin:
         state_cache = state_pool.state_cache_3d
         table_cache = fm.dsv4_explicit_state_block_tables
         if ratio not in table_cache:
-            table_cache[ratio] = _build_explicit_state_block_table(
+            table_cache[ratio] = _build_paged_state_block_table(
                 compress_ratio=ratio,
                 coff=coff,
                 state_pool=state_pool,
@@ -416,7 +429,7 @@ class CompressorAscendBackendMixin:
             coff=coff,
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
-            cache_mode=2,
+            cache_mode=_COMPRESSOR_CACHE_MODE,
         )
 
         # prefill output may be padded; trim to loc length

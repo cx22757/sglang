@@ -538,6 +538,10 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        # Establish DSV4's HCCL communication domain before a HiCache backend
+        # initializes another NPU RoCE transport such as MemFabric device_rdma.
+        self.maybe_init_hccl_dp_prewarm()
+
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
@@ -578,7 +582,6 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         self.emit_metrics_constants()
-        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)

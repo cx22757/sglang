@@ -1,0 +1,1198 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to SGLang project
+
+"""HiCache L3 storage backend for Ascend MemCache.
+
+This backend is implemented in parallel to Mooncake (not inheriting MooncakeStore).
+It follows the same HiCacheStorage contract and key layout strategy, while using
+`memcache_hybrid.DistributedObjectStore` as the underlying object store.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import logging
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple
+
+import requests
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.observability.metrics_collector import StorageMetrics
+
+SETUP_TIMEOUT = 600  # seconds
+
+logger = logging.getLogger(__name__)
+
+# Keys handled by SGLang only; not applied to memcache_hybrid.LocalConfig.
+_MEMCACHE_CTRL_KEYS = frozenset(
+    {
+        "device_id",
+        "init_bm",
+        "conf_file_path",
+        "check_server",
+        "metrics_url",
+        "memcache_metrics_url",
+        "extra_backend_tag",
+    }
+)
+
+
+@dataclass
+class AscendMemcacheConfig:
+    """Merged Memcache LocalConfig/control fields from JSON and ``extra_config``."""
+
+    local_fields: dict
+    ctrl: dict
+
+    @staticmethod
+    def from_sources(
+        storage_config: Optional[HiCacheStorageConfig],
+    ) -> AscendMemcacheConfig:
+        merged: dict = {}
+        if envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.is_set():
+            path = envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.get()
+            try:
+                with open(path, encoding="utf-8") as fin:
+                    merged.update(json.load(fin))
+                logger.info("Memcache configuration loaded from %s", path)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to load Memcache configuration from {path}: {exc}"
+                ) from exc
+
+        extra = getattr(storage_config, "extra_config", None) or {}
+        merged.update(extra)
+
+        local_fields = {k: v for k, v in merged.items() if k not in _MEMCACHE_CTRL_KEYS}
+        ctrl = {k: merged[k] for k in _MEMCACHE_CTRL_KEYS if k in merged}
+
+        return AscendMemcacheConfig(local_fields=local_fields, ctrl=ctrl)
+
+    def apply_to_local_config(self, local_cfg: Any) -> List[str]:
+        unknown: List[str] = []
+        for key, value in self.local_fields.items():
+            if hasattr(local_cfg, key):
+                setattr(local_cfg, key, value)
+            else:
+                unknown.append(key)
+        return unknown
+
+
+def _default_memcache_device_id(
+    storage_config: Optional[HiCacheStorageConfig],
+) -> int:
+    """Infer NPU device id for the current process (respects ASCEND_RT_VISIBLE_DEVICES)."""
+    try:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return int(torch.npu.current_device())
+    except Exception:
+        pass
+    if storage_config is not None:
+        return storage_config.tp_rank
+    return 0
+
+
+def _resolve_memcache_device_id(
+    ctrl: dict,
+    storage_config: Optional[HiCacheStorageConfig],
+) -> int:
+    """Resolve memcache ``init(device_id)`` for the current scheduler process.
+
+    SGLang runs one TP worker process per card; each process constructs its own
+    ``AscendMemcacheStore`` and must call ``init`` with that process's NPU id.
+
+    Resolution order:
+    - ``device_id`` omitted: ``torch.npu.current_device()`` or ``tp_rank``
+    - ``device_id`` JSON object / JSON string: per-``tp_rank`` map (Mooncake-style)
+    - scalar ``device_id``: use as configured (caller must set correctly per node)
+    """
+    if "device_id" not in ctrl:
+        return _default_memcache_device_id(storage_config)
+
+    raw = ctrl["device_id"]
+    device_config = raw if isinstance(raw, dict) else None
+    if device_config is None and isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            device_config = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Failed to parse device_id as JSON: %s", raw)
+            device_config = None
+
+    if isinstance(device_config, dict):
+        tp_rank = storage_config.tp_rank if storage_config is not None else 0
+        if tp_rank in device_config:
+            return int(device_config[tp_rank])
+        if str(tp_rank) in device_config:
+            return int(device_config[str(tp_rank)])
+        logger.warning(
+            "device_id map has no entry for tp_rank=%s; falling back to auto device id",
+            tp_rank,
+        )
+        return _default_memcache_device_id(storage_config)
+
+    device_id = int(raw)
+    if storage_config is not None and storage_config.tp_size > 1:
+        logger.warning(
+            "Ascend memcache device_id=%s is shared by all TP ranks; for multi-card "
+            "deployments omit device_id from config or use a per-rank JSON map.",
+            ctrl["device_id"],
+        )
+    return device_id
+
+
+class AscendMemcacheStore(HiCacheStorage):
+    """HiCache storage backend backed by Ascend MemCache (`memcache_hybrid`)."""
+
+    def __init__(
+        self,
+        storage_config: HiCacheStorageConfig = None,
+        mem_pool: HostKVCache = None,
+    ):
+        self.store = None
+        self.storage_config = storage_config
+        self._store_initialized = False
+        self._store_init_lock = threading.Lock()
+        self._pending_buffers: List[Tuple[int, int]] = []
+
+        try:
+            from memcache_hybrid import DistributedObjectStore, LocalConfig
+        except ImportError as e:
+            raise ImportError(
+                "Ascend Memcache HiCache backend requires `memcache_hybrid`. "
+                "Install it with `pip install memcache_hybrid` and deploy "
+                "MetaService/LocalService according to https://gitcode.com/Ascend/memcache"
+            ) from e
+
+        try:
+            config = AscendMemcacheConfig.from_sources(storage_config)
+            local_cfg = LocalConfig()
+            unknown_fields = config.apply_to_local_config(local_cfg)
+            if unknown_fields:
+                logger.warning(
+                    "Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields
+                )
+
+            ctrl = config.ctrl
+            device_id = _resolve_memcache_device_id(ctrl, storage_config)
+            init_bm = bool(ctrl.get("init_bm", True))
+            self._store_factory = DistributedObjectStore
+            self._local_cfg = local_cfg
+            self._device_id = device_id
+            self._init_bm = init_bm
+            self._protocol = str(getattr(local_cfg, "protocol", "")).lower()
+            self._defer_runtime_init = self._should_lazy_init(
+                mem_pool=mem_pool,
+                protocol=self._protocol,
+                init_bm=init_bm,
+                host_pool_names=getattr(storage_config, "host_pool_names", ()),
+            )
+            # Runtime setup is deferred for both SDMA and RDMA. Only SDMA needs
+            # ordinary-DRAM staging for NPU-pinned host pointers; RDMA keeps its
+            # registerable HugeTLB-backed host buffers.
+            self._use_dram_staging = (
+                self._defer_runtime_init and self._protocol == "device_sdma"
+            )
+
+            self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
+                "memcache_metrics_url"
+            )
+            self._check_server_enabled = bool(ctrl.get("check_server", False))
+            self.extra_backend_tag = ctrl.get("extra_backend_tag")
+
+            self._init_runtime_fields(storage_config)
+
+            if self._check_server_enabled:
+                self.check_server()
+
+            if self._defer_runtime_init:
+                logger.info(
+                    "Delay Ascend memcache BM/HYBM initialization until the first "
+                    "DSV4 L3 write (protocol=%s).",
+                    self._protocol,
+                )
+            else:
+                self._ensure_initialized()
+
+            if not init_bm:
+                logger.info(
+                    "Memcache init_bm is False; skip warmup because read/write is unavailable in pure client mode."
+                )
+            elif not envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.get():
+                logger.warning(
+                    "Ascend memcache warmup is disabled "
+                    f"({envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.name}=0). "
+                    "Set it to true to run the register-time warmup probe."
+                )
+        except ValueError as e:
+            logger.error("Ascend Memcache configuration failed: %s", e)
+            raise
+        except Exception as exc:
+            logger.error("Ascend Memcache store initialization failed: %s", exc)
+            raise
+
+    @staticmethod
+    def _should_lazy_init(
+        mem_pool: Any,
+        protocol: Any,
+        init_bm: bool,
+        host_pool_names: Any = (),
+    ) -> bool:
+        """Defer transport setup for DSV4 until after its first model forward."""
+        if not init_bm or str(protocol).lower() not in {
+            "device_sdma",
+            "device_rdma",
+        }:
+            return False
+        dsv4_pool_names = {
+            str(PoolName.DEEPSEEK_V4_C4),
+            str(PoolName.DEEPSEEK_V4_C4_INDEXER),
+            str(PoolName.DEEPSEEK_V4_C128),
+            str(PoolName.DEEPSEEK_V4_C4_STATE),
+            str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+            str(PoolName.DEEPSEEK_V4_C128_STATE),
+        }
+        actual_pool_names = {
+            str(getattr(entry, "name", ""))
+            for entry in (getattr(mem_pool, "entries", None) or [])
+        }
+        actual_pool_names.update(str(name) for name in (host_pool_names or ()))
+        return not actual_pool_names.isdisjoint(dsv4_pool_names)
+
+    def _is_store_initialized(self) -> bool:
+        # Keep helpers built with __new__ in focused unit tests compatible.
+        return getattr(self, "_store_initialized", self.store is not None)
+
+    def _register_buffer_meta(self, ptr: int, size: int) -> None:
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            logger.error("Failed to register buffer, error code: %s", ret_code)
+            raise RuntimeError(
+                f"Failed to register buffer to Ascend Memcache, error code: {ret_code}"
+            )
+
+    def _ensure_initialized(self) -> None:
+        """Initialize BM/HYBM once and then register every deferred host buffer."""
+        if self._is_store_initialized():
+            return
+        with self._store_init_lock:
+            if self._is_store_initialized():
+                return
+            store = self._store_factory()
+            try:
+                if store.setup(self._local_cfg) != 0:
+                    raise RuntimeError(
+                        "memcache_hybrid.DistributedObjectStore.setup failed"
+                    )
+                if store.init(self._device_id, self._init_bm) != 0:
+                    raise RuntimeError(
+                        "memcache_hybrid.DistributedObjectStore.init failed"
+                    )
+                self.store = store
+                for ptr, size in self._pending_buffers:
+                    self._register_buffer_meta(ptr, size)
+                self._store_initialized = True
+                self._pending_buffers.clear()
+            except Exception:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+                self.store = None
+                self._store_initialized = False
+                raise
+
+            tp_rank = self.storage_config.tp_rank if self.storage_config else 0
+            logger.info(
+                "Ascend memcache store initialized (tp_rank=%s, device_id=%s, "
+                "init_bm=%s, deferred=%s)",
+                tp_rank,
+                self._device_id,
+                self._init_bm,
+                getattr(self, "_defer_runtime_init", False),
+            )
+
+    def _init_runtime_fields(
+        self, storage_config: Optional[HiCacheStorageConfig]
+    ) -> None:
+        self.enable_storage_metrics = False
+        if storage_config is not None:
+            self.is_mla_backend = storage_config.is_mla_model
+            self.local_rank = storage_config.tp_rank
+            self.pp_rank = storage_config.pp_rank
+            self.pp_size = storage_config.pp_size
+            self.attn_cp_rank = storage_config.attn_cp_rank
+            self.attn_cp_size = storage_config.attn_cp_size
+            self.enable_storage_metrics = storage_config.enable_storage_metrics
+        else:
+            self.is_mla_backend = False
+            self.local_rank = 0
+            self.pp_rank = 0
+            self.pp_size = 1
+            self.attn_cp_rank = 0
+            self.attn_cp_size = 1
+
+        self.enable_pp = self.pp_size > 1
+        self.enable_cp = self.attn_cp_size > 1
+        if self.enable_pp or self.enable_cp:
+            self.mha_suffix = f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
+            self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
+        else:
+            self.mha_suffix = f"{self.local_rank}"
+            self.mla_suffix = ""
+
+        self.split_factor = 0
+        if self.storage_config is not None and self.storage_config.should_split_heads:
+            self.split_factor = (
+                self.storage_config.tp_lcm_size // self.storage_config.tp_size
+            )
+            base_rank = self.local_rank * self.split_factor
+            target_ranks = [base_rank + i for i in range(self.split_factor)]
+            if self.enable_pp or self.enable_cp:
+                self.mha_suffix = [
+                    f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
+                    for rank in target_ranks
+                ]
+            else:
+                self.mha_suffix = [f"{rank}" for rank in target_ranks]
+
+        self.registered_pools = {}
+        self.gb_per_page = None
+        self.prefetch_pgs = []
+        self.backup_pgs = []
+        self.prefetch_bandwidth = []
+        self.backup_bandwidth = []
+
+    def register_buffer(self, tensor: torch.Tensor):
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        if getattr(self, "_use_dram_staging", False):
+            # SGLang DSV4 L2 is NPU-pinned host memory. Its pointer falls in the
+            # NPU VA numeric range, so SmemBmRegisterUserMem misclassifies it as
+            # local HBM. Host H2G/G2H I/O does not require registration (matching
+            # MemCache's CPU tensor examples); registering it corrupts SDMA data.
+            return
+        if not self._is_store_initialized():
+            buffer_meta = (ptr, size)
+            if buffer_meta not in self._pending_buffers:
+                self._pending_buffers.append(buffer_meta)
+            return
+        self._register_buffer_meta(ptr, size)
+
+    def check_server(self) -> None:
+        url = self._memcache_metrics_url
+        if not url:
+            logger.warning(
+                "Memcache check_server is true but no metrics_url/memcache_metrics_url was provided; skipping readiness wait."
+            )
+            return
+
+        start = time.perf_counter()
+        while time.perf_counter() - start < SETUP_TIMEOUT:
+            try:
+                resp = requests.get(url, timeout=3)
+                if resp.status_code == 200:
+                    logger.info("Memcache metrics endpoint is reachable.")
+                    return
+            except Exception:
+                pass
+            logger.debug(
+                "Waiting for Memcache metrics endpoint at %s (%.1fs elapsed).",
+                url,
+                time.perf_counter() - start,
+            )
+            time.sleep(3)
+
+        raise TimeoutError(
+            f"Timed out after {SETUP_TIMEOUT}s waiting for Memcache metrics URL {url}"
+        )
+
+    def warmup(self):
+        warmup_key = "sglang_ascend_memcache_store_warmup_key" + uuid.uuid4().hex
+        # memcache_hybrid Python API examples use mutable bytearray in put().
+        warmup_value = bytearray(4 * 1024)
+        put_ret = self.store.put(warmup_key, warmup_value)
+        if put_ret != 0:
+            raise RuntimeError(f"warmup put failed: {put_ret}")
+
+        exist_ret = self.store.is_exist(warmup_key)
+        if exist_ret != 1:
+            raise RuntimeError(f"warmup is_exist failed: {exist_ret}")
+
+        get_val = self.store.get(warmup_key)
+        if get_val != warmup_value:
+            raise RuntimeError("warmup get payload mismatch")
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        super().register_mem_pool_host(mem_pool_host)
+        # DSV4 FULL is a logical anchor. It owns hashes/slots but no payload.
+        if self.mem_pool_host.kv_buffer is None:
+            self.gb_per_page = 0.0
+            logger.info(
+                "Ascend Memcache registered logical KV anchor without a buffer."
+            )
+            return
+        assert self.mem_pool_host.layout in [
+            "page_first",
+            "page_first_direct",
+            "page_head",
+            "page_first_kv_split",
+        ], (
+            "ascend_memcache storage backend only support page_first, page_first_direct, "
+            "page_head and page_first_kv_split layout"
+        )
+        try:
+            self.register_buffer(self.mem_pool_host.kv_buffer)
+            if self._mla_uses_kv_split():
+                self.register_buffer(self.mem_pool_host.v_buffer)
+                if getattr(self.mem_pool_host, "index_k_buffer", None) is not None:
+                    self.register_buffer(self.mem_pool_host.index_k_buffer)
+        except TypeError as err:
+            logger.error("Failed to register buffer to Ascend Memcache Store: %s", err)
+            raise TypeError("Ascend Memcache Store Register Buffer Error.") from err
+
+        if envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.get():
+            self.warmup()
+            logger.info("Ascend memcache store warmup completed successfully.")
+
+        bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
+        self.gb_per_page = bytes_per_page / (1 << 30)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        # KV anchor memory is already registered via register_mem_pool_host().
+        # v2 here only registers additional hybrid pools.
+        if host_pool_name == PoolName.KV:
+            return
+        layout = getattr(host_pool, "layout", None)
+        if layout not in {
+            "page_first",
+            "page_first_direct",
+            "page_head",
+            "page_first_kv_split",
+        }:
+            raise ValueError(
+                "Ascend Memcache hybrid pools require a storage-compatible "
+                f"page-first layout, got {layout!r} for {host_pool_name}."
+            )
+        # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
+        # the corresponding host pool implementation at runtime.
+        self.registered_pools[host_pool_name] = host_pool
+
+        # Hybrid pools expose the tensors that memcache requires for zero-copy I/O.
+        # The storage backend only depends on this accessor, not concrete fields.
+        buf_list = host_pool.get_hybrid_pool_buffer()
+        for buf in buf_list:
+            self.register_buffer(buf)
+
+    def prepare_for_backup(self) -> None:
+        # DSV4 is TP-replicated, so non-zero TP ranks do not execute put(). They
+        # still need BM/HYBM ready for later L3 reads; the post-inference backup
+        # boundary initializes every rank without perturbing the first forward.
+        self._ensure_initialized()
+
+    def _tag_keys(self, keys: List[str]) -> List[str]:
+        if self.extra_backend_tag is None:
+            return keys
+        return [f"{self.extra_backend_tag}_{key}" for key in keys]
+
+    def _mla_uses_kv_split(self) -> bool:
+        return (
+            self.is_mla_backend
+            and self.mem_pool_host is not None
+            and getattr(self.mem_pool_host, "layout", None) == "page_first_kv_split"
+        )
+
+    def _get_hybrid_page_component_keys(
+        self, page_keys: List[str], transfer: PoolTransfer
+    ) -> Tuple[List[str], int]:
+        # A logical "page" may map to multiple physical objects in storage.
+        # - INDEXER: one key per page
+        # - MAMBA  : one temporal key + N conv keys per page
+        # key_multiplier records how many component keys are generated per page.
+        name = transfer.name
+        suffixes = []
+        if name == PoolName.INDEXER:
+            suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
+        elif name == PoolName.MAMBA:
+            pools = getattr(self, "registered_pools", {})
+            mamba_pool = pools.get(PoolName.MAMBA)
+            conv_num = len(getattr(mamba_pool, "conv_buffer", None) or [])
+            base_suffix = f"_{self.mha_suffix}"
+            suffixes = [f"{base_suffix}_temporal"] + [
+                f"{base_suffix}_conv_{i}" for i in range(conv_num)
+            ]
+        elif name == PoolName.DEEPSEEK_V4_C4_INDEXER:
+            suffixes = [
+                f"_{self.mla_suffix}_{name}_k",
+                f"_{self.mla_suffix}_{name}_scale",
+            ]
+        elif name in (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        ):
+            suffixes = [f"_{self.mla_suffix}_{name}"]
+        key_multiplier = len(suffixes)
+        component_keys = [
+            f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
+        ]
+        return component_keys, key_multiplier
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        logical_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
+        if logical_anchor:
+            # Logical anchor: required physical pools decide the usable prefix.
+            kv_pages = len(keys)
+        else:
+            kv_pages = self.batch_exists(keys, extra_info)
+
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        transfers = pool_transfers or []
+        all_page_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+        ]
+        trailing_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+        ]
+
+        # Required prefix pools run first. Coarse objects report physical-object
+        # hits and convert them back to anchor/KV logical pages.
+        for transfer in all_page_transfers:
+            if final_pages == 0:
+                break
+            object_anchor_keys = (
+                list(transfer.keys) if transfer.keys else list(keys[:kv_pages])
+            )
+            if not object_anchor_keys:
+                final_pages = 0
+                continue
+
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                object_anchor_keys, transfer
+            )
+            component_keys = self._tag_keys(component_keys)
+            ex = self._batch_exist(component_keys)
+            if key_multiplier > 0:
+                page_exists = [
+                    all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    )
+                    for i in range(len(object_anchor_keys))
+                ]
+            else:
+                page_exists = [False] * len(object_anchor_keys)
+
+            successful_objects = (
+                page_exists.index(False) if False in page_exists else len(page_exists)
+            )
+            if successful_objects:
+                hit_count[transfer.name] = successful_objects
+
+            coverage = transfer.logical_pages_per_object
+            if coverage <= 0:
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' has invalid "
+                    f"logical_pages_per_object={coverage}."
+                )
+            final_pages = min(final_pages, successful_objects * coverage)
+
+        # The usable prefix must end at every coarse pool's object boundary.
+        for transfer in all_page_transfers:
+            coverage = transfer.logical_pages_per_object
+            final_pages -= final_pages % coverage
+
+        # Window/state pools use the tail of the prefix selected above, not the
+        # tail of the original request, which may already have diverged.
+        for transfer in trailing_transfers:
+            if final_pages == 0:
+                break
+            trailing_n = len(transfer.keys) if transfer.keys else 1
+            if final_pages < trailing_n:
+                final_pages = 0
+                break
+            transfer.keys = list(keys[final_pages - trailing_n : final_pages])
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                transfer.keys, transfer
+            )
+            ex = self._batch_exist(self._tag_keys(component_keys))
+            page_exists = (
+                [
+                    all(
+                        result == 1
+                        for result in ex[
+                            index * key_multiplier : (index + 1) * key_multiplier
+                        ]
+                    )
+                    for index in range(len(transfer.keys))
+                ]
+                if key_multiplier > 0
+                else [False] * len(transfer.keys)
+            )
+            successful_objects = (
+                page_exists.index(False) if False in page_exists else len(page_exists)
+            )
+            if successful_objects:
+                hit_count[transfer.name] = successful_objects
+            if successful_objects != len(transfer.keys):
+                final_pages = 0
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+        # Unified v2 I/O path: each PoolTransfer can expand to one or more
+        # storage objects per logical page, but API still reports page-level result.
+        results: dict = {}
+        for transfer in transfers:
+            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            if host_pool is None:
+                raise RuntimeError(
+                    f"Host pool '{transfer.name}' is not registered. "
+                    "Call register_mem_host_pool_v2() before batch_get_v2/batch_set_v2."
+                )
+            keys = transfer.keys or []
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            host_indices = transfer.host_indices
+            if len(keys) == 0:
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' has empty keys in batch v2 I/O."
+                )
+            if host_indices is None:
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' has null host_indices in batch v2 I/O."
+                )
+            if len(keys) != len(host_indices) // page_size:
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' keys/host_indices mismatch: "
+                    f"len(keys)={len(keys)}, len(host_indices)={len(host_indices)}, page_size={page_size}."
+                )
+
+            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            key_strs = self._tag_keys(key_strs)
+            if key_multiplier <= 0:
+                raise ValueError(
+                    f"Unsupported hybrid pool for Memcache: {transfer.name}"
+                )
+
+            ptr_list, element_size_list = self._get_transfer_buffer_meta(
+                host_pool, transfer, host_indices
+            )
+            if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' physical object mismatch: "
+                    f"keys={len(key_strs)}, ptrs={len(ptr_list)}, "
+                    f"sizes={len(element_size_list)}. Use a storage-compatible "
+                    "page-first host layout."
+                )
+
+            if is_set:
+                exist_result = self._batch_exist(key_strs)
+                io_results = [0 if state == 1 else -1 for state in exist_result]
+                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+                if missing_idx:
+                    start_time = time.perf_counter()
+                    put_results = self._put_batch_zero_copy_impl(
+                        [key_strs[i] for i in missing_idx],
+                        [ptr_list[i] for i in missing_idx],
+                        [element_size_list[i] for i in missing_idx],
+                    )
+                    for i, res in zip(missing_idx, put_results):
+                        io_results[i] = res
+            else:
+                start_time = time.perf_counter()
+                io_results = self._get_batch_zero_copy_impl(
+                    key_strs, ptr_list, element_size_list
+                )
+            pool_results = self._batch_postprocess(
+                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
+            )
+            results[transfer.name] = pool_results
+        return results
+
+    def _get_transfer_buffer_meta(self, host_pool, transfer, host_indices):
+        ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
+        if transfer.name != PoolName.DEEPSEEK_V4_C4_INDEXER:
+            return ptrs, sizes
+
+        if getattr(host_pool, "scale_kv_buffer", None) is None:
+            raise RuntimeError(
+                "NPU DSV4 C4 indexer storage requires both K and scale buffers."
+            )
+        scale_ptrs, scale_sizes = host_pool.get_scale_page_buffer_meta(host_indices)
+        if len(ptrs) != len(scale_ptrs):
+            raise ValueError(
+                "C4 indexer K/scale page metadata have different cardinalities: "
+                f"K={len(ptrs)}, scale={len(scale_ptrs)}."
+            )
+        object_ptrs = []
+        object_sizes = []
+        for k_ptr, k_size, scale_ptr, scale_size in zip(
+            ptrs, sizes, scale_ptrs, scale_sizes
+        ):
+            object_ptrs.extend((k_ptr, scale_ptr))
+            object_sizes.extend((k_size, scale_size))
+        return object_ptrs, object_sizes
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=True)
+
+    def _get_mha_split_heads_buffer_meta(self, keys, indices):
+        ptr_list, element_size_list = (
+            self.mem_pool_host.get_split_heads_page_buffer_meta(
+                indices, self.split_factor
+            )
+        )
+        key_list = []
+        for key_ in keys:
+            for suffix in self.mha_suffix:
+                key_list.append(f"{key_}_{suffix}_k")
+                key_list.append(f"{key_}_{suffix}_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
+    def _get_mha_buffer_meta(self, keys, indices):
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+        key_list = []
+        for key_ in keys:
+            key_list.append(f"{key_}_{self.mha_suffix}_k")
+            key_list.append(f"{key_}_{self.mha_suffix}_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
+    def _get_mla_buffer_meta(self, keys, indices):
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+        key_list = []
+        for key_ in keys:
+            key_list.append(f"{key_}_{self.mla_suffix}_k")
+            if self._mla_uses_kv_split():
+                key_list.append(f"{key_}_{self.mla_suffix}_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
+    def _batch_preprocess(self, keys, host_indices):
+        assert len(keys) > 0
+        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        if self.is_mla_backend:
+            return self._get_mla_buffer_meta(keys, host_indices)
+        if self.storage_config and self.storage_config.should_split_heads:
+            return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+        return self._get_mha_buffer_meta(keys, host_indices)
+
+    def _batch_postprocess(
+        self, results: List[int], is_set_operate: bool = False, key_multiplier=None
+    ):
+        """
+        After `_get_batch_zero_copy_impl()`, each element is a positive byte length on a
+        successful read, or negative on error.
+
+        ``batch_put_from`` return codes passed into this path use 0 for success and
+        negative values for errors (`_batch_io_v2` / `batch_set_v1`).
+        """
+
+        if key_multiplier is None:
+            if self.is_mla_backend:
+                key_multiplier = 2 if self._mla_uses_kv_split() else 1
+            else:
+                key_multiplier = 2
+                if self.storage_config and self.storage_config.should_split_heads:
+                    key_multiplier *= self.split_factor
+
+        if key_multiplier <= 0 or len(results) % key_multiplier != 0:
+            raise RuntimeError(
+                "Memcache result cardinality is not divisible by the physical "
+                f"object multiplier: results={len(results)}, multiplier={key_multiplier}."
+            )
+        result_groups = [
+            results[i : i + key_multiplier]
+            for i in range(0, len(results), key_multiplier)
+        ]
+        return [
+            (
+                all(res == 0 for res in group)
+                if is_set_operate
+                else all(res > 0 for res in group)
+            )
+            for group in result_groups
+        ]
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
+        # Apply extra_backend_tag prefix if available
+        keys = self._tag_keys(keys)
+
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+
+        start_time = time.perf_counter()
+        get_results = self._get_batch_zero_copy_impl(
+            key_strs, buffer_ptrs, buffer_sizes
+        )
+        end_time = time.perf_counter()
+
+        if self.enable_storage_metrics and end_time > start_time:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
+
+        return self._batch_postprocess(get_results, is_set_operate=False)
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
+        # Apply extra_backend_tag prefix if available
+        page_keys = self._tag_keys(keys)
+
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            page_keys, host_indices
+        )
+        exist_result = self._batch_exist(key_strs)
+        existing_keys = sum(1 for state in exist_result if state == 1)
+
+        set_keys = []
+        set_buffer_ptrs = []
+        set_buffer_sizes = []
+        set_indices = []
+        set_results = [-1] * len(key_strs)
+        for i in range(len(key_strs)):
+            if exist_result[i] != 1:
+                set_keys.append(key_strs[i])
+                set_buffer_ptrs.append(buffer_ptrs[i])
+                set_buffer_sizes.append(buffer_sizes[i])
+                set_indices.append(i)
+            else:
+                set_results[i] = 0
+
+        if set_keys:
+            start_time = time.perf_counter()
+            put_results = self._put_batch_zero_copy_impl(
+                set_keys, set_buffer_ptrs, set_buffer_sizes
+            )
+            end_time = time.perf_counter()
+            ok = sum(1 for r in put_results if r == 0)
+
+            if self.enable_storage_metrics and end_time > start_time:
+                self.backup_pgs.append(len(set_keys))
+                self.backup_bandwidth.append(
+                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+                )
+
+            for i in range(len(set_indices)):
+                set_results[set_indices[i]] = put_results[i]
+        page_results = self._batch_postprocess(set_results, is_set_operate=True)
+        return page_results
+
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        _ = value
+        assert target_location is not None and target_sizes is not None
+        exist_result = self._batch_exist([key])
+        if exist_result[0] == 1:
+            return True
+        put_result = self._put_batch_zero_copy_impl(
+            [key], [target_location], [target_sizes]
+        )
+        return put_result[0] == 0
+
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[List[torch.Tensor]] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        _ = values
+        assert target_locations is not None and target_sizes is not None
+        assert len(keys) == len(target_locations) == len(target_sizes)
+
+        if len(keys) == 0:
+            return False
+
+        for i in range(len(keys)):
+            if (
+                keys[i] is None
+                or target_locations[i] is None
+                or target_sizes[i] is None
+            ):
+                return False
+
+        exist_result = self._batch_exist(keys)
+        set_keys = []
+        set_target_locations = []
+        set_target_sizes = []
+        set_indices = []
+        for i in range(len(keys)):
+            if exist_result[i] != 1:
+                set_keys.append(keys[i])
+                set_target_locations.append(target_locations[i])
+                set_target_sizes.append(target_sizes[i])
+                set_indices.append(i)
+
+        start_time = time.perf_counter()
+        put_result = self._put_batch_zero_copy_impl(
+            set_keys, set_target_locations, set_target_sizes
+        )
+        end_time = time.perf_counter()
+
+        if self.enable_storage_metrics and set_keys and end_time > start_time:
+            self.backup_pgs.append(len(set_keys))
+            self.backup_bandwidth.append(
+                len(set_keys) / (end_time - start_time) * self.gb_per_page
+            )
+
+        for i in range(len(set_indices)):
+            if put_result[i] == 0:
+                exist_result[set_indices[i]] = 1
+
+        success_count = 0
+        for i in range(len(keys)):
+            if exist_result[i] == 0:
+                break
+            success_count += 1
+        return success_count == len(keys)
+
+    def get(
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        assert target_location is not None and target_sizes is not None
+        get_result = self._get_batch_zero_copy_impl(
+            [key], [target_location], [target_sizes]
+        )
+        return get_result[0] > 0
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> int:
+        assert len(keys) == len(target_locations) == len(target_sizes)
+        if len(keys) == 0:
+            return 0
+
+        start_time = time.perf_counter()
+        get_result = self._get_batch_zero_copy_impl(
+            keys, target_locations, target_sizes
+        )
+        end_time = time.perf_counter()
+        hit_keys = sum(1 for r in get_result if r > 0)
+
+        if self.is_mla_backend:
+            key_multiplier = 2 if self._mla_uses_kv_split() else 1
+        else:
+            key_multiplier = 2
+
+        if self.enable_storage_metrics and end_time > start_time:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
+
+        for i in range(len(keys)):
+            if get_result[i] < 0:
+                return i // key_multiplier
+        return len(keys) // key_multiplier
+
+    def exists(self, key: str) -> bool:
+        exist_result = self._batch_exist([key])
+        return exist_result[0] == 1
+
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return len(keys)
+        page_keys = self._tag_keys(keys)
+
+        if self.is_mla_backend:
+            query_keys = []
+            for key in page_keys:
+                query_keys.append(f"{key}_{self.mla_suffix}_k")
+                if self._mla_uses_kv_split():
+                    query_keys.append(f"{key}_{self.mla_suffix}_v")
+            key_multiplier = 2 if self._mla_uses_kv_split() else 1
+        else:
+            query_keys = []
+            if self.storage_config and self.storage_config.should_split_heads:
+                for key in page_keys:
+                    for suffix in self.mha_suffix:
+                        query_keys.append(f"{key}_{suffix}_k")
+                        query_keys.append(f"{key}_{suffix}_v")
+                key_multiplier = 2 * self.split_factor
+            else:
+                for key in page_keys:
+                    query_keys.append(f"{key}_{self.mha_suffix}_k")
+                    query_keys.append(f"{key}_{self.mha_suffix}_v")
+                key_multiplier = 2
+
+        exist_result = self._batch_exist(query_keys)
+        hit_component_keys = 0
+        for state in exist_result:
+            if state != 1:
+                break
+            hit_component_keys += 1
+        for i in range(len(query_keys)):
+            if exist_result[i] != 1:
+                return i // key_multiplier
+        return len(query_keys) // key_multiplier
+
+    def clear(self) -> None:
+        if not self._is_store_initialized():
+            return
+        self.store.remove_all()
+
+    def close(self) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.close()
+        except Exception as e:
+            logger.warning("Ascend Memcache store.close failed: %s", e)
+        self.store = None
+        self._store_initialized = False
+
+    def _put_batch_zero_copy_impl(
+        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
+    ) -> List[int]:
+        self._ensure_initialized()
+        io_ptrs = buffer_ptrs
+        staging_buffers = None
+        if getattr(self, "_use_dram_staging", False):
+            # torch_npu pinned-host allocations use an Ascend UVA address.  The
+            # address is CPU-accessible, but MemCache device_sdma does not handle
+            # it as ordinary MEDIA_DRAM reliably: the copy can return success
+            # while persisting unrelated bytes.  Copy each object to a regular
+            # process-DRAM buffer before H2G.  This is deliberately limited to
+            # the DSV4 device_sdma path; device_rdma retains its registered
+            # HugeTLB zero-copy behavior even though runtime init is deferred.
+            staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
+            for src, dst, size in zip(buffer_ptrs, io_ptrs, buffer_sizes):
+                ctypes.memmove(dst, src, size)
+        raw = self.store.batch_put_from(key_strs, io_ptrs, buffer_sizes)
+        if len(raw) != len(key_strs):
+            raise RuntimeError(
+                f"Memcache batch_put_from returned {len(raw)} results for "
+                f"{len(key_strs)} objects."
+            )
+        out = [int(code) for code in raw]
+        return out
+
+    def _get_batch_zero_copy_impl(
+        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
+    ) -> List[int]:
+        if not self._is_store_initialized():
+            return [-1] * len(key_strs)
+        io_ptrs = buffer_ptrs
+        staging_buffers = None
+        if getattr(self, "_use_dram_staging", False):
+            staging_buffers, io_ptrs = self._make_dram_staging_buffers(buffer_sizes)
+        raw = self.store.batch_get_into(key_strs, io_ptrs, buffer_sizes)
+        if len(raw) != len(key_strs):
+            raise RuntimeError(
+                f"Memcache batch_get_into returned {len(raw)} results for "
+                f"{len(key_strs)} objects."
+            )
+        # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
+        # positive values for success and negative values for failures.
+        out: List[int] = []
+        for i, (code, sz) in enumerate(zip(raw, buffer_sizes)):
+            code = int(code)
+            if code == 0:
+                if staging_buffers is not None:
+                    ctypes.memmove(buffer_ptrs[i], io_ptrs[i], sz)
+                out.append(int(sz))
+            else:
+                out.append(-abs(code))
+        return out
+
+    @staticmethod
+    def _make_dram_staging_buffers(
+        buffer_sizes: List[int],
+    ) -> Tuple[List[Any], List[int]]:
+        """Allocate ordinary process DRAM and keep it alive for one MemCache call."""
+        buffers = [ctypes.create_string_buffer(int(size)) for size in buffer_sizes]
+        return buffers, [ctypes.addressof(buffer) for buffer in buffers]
+
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+        if not key_strs:
+            return []
+        if not self._is_store_initialized():
+            return [0] * len(key_strs)
+        raw = self.store.batch_is_exist(key_strs)
+        if len(raw) != len(key_strs):
+            raise RuntimeError(
+                f"Memcache batch_is_exist returned {len(raw)} results for "
+                f"{len(key_strs)} objects."
+            )
+        return [int(code) for code in raw]
+
+    def get_stats(self):
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
+        storage_metrics.backup_pgs.extend(self.backup_pgs)
+        storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
+        storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
+        self.prefetch_pgs.clear()
+        self.backup_pgs.clear()
+        self.prefetch_bandwidth.clear()
+        self.backup_bandwidth.clear()
+        return storage_metrics

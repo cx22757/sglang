@@ -2790,11 +2790,12 @@ class ServerArgs:
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, ascend_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
                 "mooncake",
+                "ascend_memcache",
                 "hf3fs",
                 "nixl",
                 "aibrix",
@@ -8407,7 +8408,7 @@ class ServerArgs:
     def _resolve_storage_layout_compatibility(self):
         cfg = resolving_view(self)
         if (
-            cfg.hicache_storage_backend != "mooncake"
+            cfg.hicache_storage_backend not in ("mooncake", "ascend_memcache")
             or cfg.hicache_mem_layout != "layer_first"
         ):
             return
@@ -8416,6 +8417,19 @@ class ServerArgs:
             new_layout = "page_first_direct"
         elif cfg.hicache_io_backend == "kernel":
             new_layout = "page_first"
+        elif cfg.hicache_io_backend == "kernel_ascend":
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            # The generic MLA host pool has separate K/V buffers, while DSV4
+            # uses logical FULL plus independently paged C4/C128 pools. Those
+            # side pools do not implement page_first_kv_split and require one
+            # contiguous page object for zero-copy L3 I/O.
+            new_layout = (
+                "page_first_kv_split"
+                if self.use_mla_backend()
+                and not is_deepseek_v4(self.get_model_config().hf_config)
+                else "page_first_direct"
+            )
         else:
             # Keep current behavior for unknown backends (e.g., kernel_ascend).
             new_layout = cfg.hicache_mem_layout
@@ -8425,7 +8439,7 @@ class ServerArgs:
             hicache_mem_layout=new_layout,
         )
         logger.warning(
-            f"Mooncake storage backend does not support layer_first layout, "
+            f"Mooncake/Ascend MemCache storage backends do not support layer_first layout, "
             f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
         )
 

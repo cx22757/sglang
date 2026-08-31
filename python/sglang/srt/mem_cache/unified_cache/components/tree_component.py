@@ -69,6 +69,8 @@ class PrepareLoadBackResult:
 
     # Freshly allocated device mamba slot, recovered on failure.
     allocated_mamba_slot: Optional[torch.Tensor] = None
+    # Optional component-local anchor needed to finalize a successful H->D.
+    anchor_node_id: Optional[NodeId] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,7 +84,6 @@ class PreparePrefetchResult:
 
 
 class CacheTransferPhase(str, Enum):
-
     BACKUP_HOST = "backup_host"  # D→H
     LOAD_BACK = "load_back"  # H→D
     BACKUP_STORAGE = "backup_storage"  # H→Storage
@@ -90,7 +91,6 @@ class CacheTransferPhase(str, Enum):
 
 
 class LRURefreshPhase(str, Enum):
-
     WALKDOWN = "walkdown"  # touching a node while walking through the tree
     MATCH_END = "match_end"  # end of a successful prefix match
     INSERT_END = "insert_end"  # after a new/updated leaf is committed
@@ -495,9 +495,9 @@ class TreeComponent(ABC):
 
     def evict_device_start(self, request_cnt: int) -> None:
         """Begin this component's device-eviction walk (build its cursor/heap)."""
-        assert (
-            not self.is_evict_device_ongoing
-        ), f"{self.component_type} device eviction already in progress"
+        assert not self.is_evict_device_ongoing, (
+            f"{self.component_type} device eviction already in progress"
+        )
         self._evict_device_start(request_cnt)
         self.is_evict_device_ongoing = True
 
@@ -519,9 +519,9 @@ class TreeComponent(ABC):
 
     def evict_device_end(self) -> None:
         """Clear this component's device-eviction walk state."""
-        assert (
-            self.is_evict_device_ongoing
-        ), f"{self.component_type} device eviction not started"
+        assert self.is_evict_device_ongoing, (
+            f"{self.component_type} device eviction not started"
+        )
         self._evict_device_end()
         self.is_evict_device_ongoing = False
 
@@ -656,6 +656,17 @@ class TreeComponent(ABC):
     ) -> PreparePrefetchResult:
         """Cache-level host pre-allocation before a prefetch builds its transfers."""
         return PreparePrefetchResult()
+
+    def align_storage_prefetch_length(
+        self, node: UnifiedTreeNode, prefetch_tokens: int
+    ) -> int:
+        """Return the storage-safe prefix length for this component.
+
+        Most components use the FULL page-aligned candidate unchanged. Components
+        with a coarser correctness boundary may shorten it before storage keys and
+        host allocations are created.
+        """
+        return prefetch_tokens
 
     def build_hicache_transfers(
         self,

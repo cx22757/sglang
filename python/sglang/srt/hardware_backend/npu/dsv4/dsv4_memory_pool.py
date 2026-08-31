@@ -7,9 +7,9 @@ rules as the GPU implementation:
 * C4A/C4Li state follows SWA physical pages.
 * C128A state follows ``req_pool_idx`` and absolute position.
 
-``NPUCompressStatePool`` only adds the contiguous 3-D view and positive dummy
-location required by the Atlas A3 ``cache_mode=2`` operator. There is no paged
-state allocator or ``cache_mode=1`` compatibility storage.
+``NPUCompressStatePool`` adds the contiguous 3-D view and reserves physical
+block 0 for the Ascend ``cache_mode=1`` operator. The remaining paged state
+storage keeps the same GPU-style ring ownership.
 """
 
 from __future__ import annotations
@@ -70,16 +70,18 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
 
 class NPUCompressStatePool(CompressStatePool):
-    """Thin A3 adapter over the shared GPU-style ring state pool.
+    """Ascend paged-state adapter over the shared GPU-style ring state pool.
 
     Allocation, sizing, ring ownership and address translation are inherited
     from :class:`CompressStatePool`. NPU only requests a contiguous 3-D view,
-    enforces the A3 FP32 contract and replaces invalid locations with a cleared
-    positive dummy row.
+    enforces the A3 FP32 contract and maps invalid locations to the cleared
+    reserved block.
 
-    Location 0 is valid in explicit mode. Invalid/history-padding locations map
-    to the final cleared row instead of ``-1`` because the A3 kernel consumes
-    unsigned offsets.
+    The Compressor ``cache_mode=1`` ABI treats block id 0 as invalid and skips
+    writes to it. One physical block is therefore reserved at the front; valid
+    state locations are shifted by ``ring_size``. ``state_page_offset`` lets
+    the HiCache state host pool expose logical SWA page 0 from physical state
+    block 1 without changing transfer indices.
     """
 
     def __init__(
@@ -105,7 +107,7 @@ class NPUCompressStatePool(CompressStatePool):
         )
         assert ring_size > 0, f"ring_size must be positive, got {ring_size}"
         super().__init__(
-            size=size,
+            size=size + ring_size,
             ring_size=ring_size,
             overlap=overlap,
             head_dim=head_dim,
@@ -117,7 +119,9 @@ class NPUCompressStatePool(CompressStatePool):
             swa_page_size=swa_page_size,
             state_cache_page_size=ring_size,
         )
-        self.dummy_state_loc = self._size - 1
+        self.state_page_offset = 1
+        self.dummy_state_loc = 0
+        self.kv_score_buffer[:ring_size].clear()
 
         # The shared pool initializes its dummy row. A cold C128 request bank
         # additionally needs every row initialized before its first partial use.
@@ -134,18 +138,18 @@ class NPUCompressStatePool(CompressStatePool):
     def translate_from_swa_loc_to_state_loc(
         self, swa_loc: torch.Tensor
     ) -> torch.Tensor:
-        return self._replace_invalid_with_dummy(
-            super().translate_from_swa_loc_to_state_loc(swa_loc)
-        )
+        state_loc = super().translate_from_swa_loc_to_state_loc(swa_loc)
+        state_loc = torch.where(state_loc < 0, state_loc, state_loc + self.ring_size)
+        return self._replace_invalid_with_dummy(state_loc)
 
     def translate_from_req_position_to_state_loc(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        return self._replace_invalid_with_dummy(
-            super().translate_from_req_position_to_state_loc(
-                req_pool_indices, positions
-            )
+        state_loc = super().translate_from_req_position_to_state_loc(
+            req_pool_indices, positions
         )
+        state_loc = torch.where(state_loc < 0, state_loc, state_loc + self.ring_size)
+        return self._replace_invalid_with_dummy(state_loc)
 
 
 class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):

@@ -91,8 +91,13 @@ class LogicalHostPool:
         self.num_release_slots = 0
 
     def destroy(self) -> None:
-        """Logical anchors own no backing buffers or registrations to release."""
-        return None
+        """Release logical allocator state during host-pool teardown."""
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        self.free_slots = torch.empty(0, dtype=torch.int64)
+        self.release_slots = []
+        self.num_release_slots = 0
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -432,7 +437,17 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return self.kv_buffer
 
     def get_hybrid_pool_buffer(self):
-        return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
+        buffers = (
+            list(self.kv_buffer)
+            if isinstance(self.kv_buffer, list)
+            else [self.kv_buffer]
+        )
+        if self.scale_kv_buffer is not None:
+            if isinstance(self.scale_kv_buffer, list):
+                buffers.extend(self.scale_kv_buffer)
+            else:
+                buffers.append(self.scale_kv_buffer)
+        return buffers
 
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
@@ -735,6 +750,27 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             return ptr_list, [page_bytes] * len(ptr_list)
         raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def get_scale_page_buffer_meta(self, indices):
+        """Return zero-copy page metadata for the NPU indexer scale buffer."""
+        if self.scale_kv_buffer is None:
+            raise RuntimeError(f"{self.pool_name}: scale buffer is not attached")
+        ptr_list = []
+        rows = self._to_page_indices(indices).tolist()
+        if self.layout == "layer_first":
+            for row in rows:
+                for layer_id in range(self.layer_num):
+                    ptr_list.append(
+                        self.scale_kv_buffer[layer_id].data_ptr()
+                        + int(row) * self.scale_item_bytes
+                    )
+            return ptr_list, [self.scale_item_bytes] * len(ptr_list)
+        if self.layout in ["page_first", "page_first_direct"]:
+            page_bytes = self.layer_num * self.scale_item_bytes
+            for row in rows:
+                ptr_list.append(self.scale_kv_buffer[int(row)].data_ptr())
+            return ptr_list, [page_bytes] * len(ptr_list)
+        raise ValueError(f"Unsupported layout: {self.layout}")
+
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         if self.layout not in ["page_first", "page_first_direct"]:
             return False
@@ -887,8 +923,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 state_tensor.shape[0], -1
             )
             usable_slots = (state_tensor.shape[0] // ring_size) * ring_size
+            page_offset = int(getattr(pool, "state_page_offset", 0))
+            first_slot = page_offset * ring_size
+            if first_slot >= usable_slots:
+                raise ValueError(
+                    f"{self.pool_name} state_page_offset={page_offset} leaves "
+                    "no transferable state pages"
+                )
             self.device_page_views.append(
-                state_bytes[:usable_slots].reshape(-1, state_page_bytes)
+                state_bytes[first_slot:usable_slots].reshape(-1, state_page_bytes)
             )
 
         self.ring_size = expected_ring_size or 0

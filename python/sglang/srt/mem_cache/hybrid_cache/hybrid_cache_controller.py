@@ -25,6 +25,7 @@ from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
@@ -586,6 +587,18 @@ class HybridCacheController(BaseHiCacheController):
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value
+        assert isinstance(hash_value, list)
+
+        if operation.pool_transfers:
+            # Storage v2 backends treat transfer.keys as authoritative. Resolve
+            # placeholders/derived keys before exists() so query and I/O use the
+            # same object names.
+            self._sync_trailing_keys(
+                operation.pool_transfers, hash_value, len(hash_value)
+            )
+            for transfer in operation.pool_transfers:
+                if transfer.keys is None and transfer.indices_from_pool == PoolName.KV:
+                    transfer.keys = list(hash_value)
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -601,6 +614,10 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        if operation.pool_transfers:
+            self._trim_prefetch_transfers(
+                operation.pool_transfers, hash_value, kv_hit_pages
+            )
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         return (
@@ -632,13 +649,32 @@ class HybridCacheController(BaseHiCacheController):
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
                         indices_from_pool=transfer.indices_from_pool,
+                        logical_pages_per_object=transfer.logical_pages_per_object,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
-        # KV pools and KV-derived pools first — determines actual completed page count
-        kv_completed_pages = super()._page_transfer(operation)
+        # A logical DSV4 FULL pool has no payload. Preserve the base controller's
+        # per-batch ACK contract while letting the physical sidecar pools decide
+        # whether the prefix is usable.
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            kv_completed_pages = 0
+            for offset in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+                if not operation.is_terminated():
+                    kv_completed_pages += len(
+                        operation.hash_value[offset : offset + STORAGE_BATCH_SIZE]
+                    )
+                self.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        operation=operation,
+                        completed_tokens=kv_completed_pages * self.page_size,
+                    )
+                )
+        else:
+            # KV pools and KV-derived pools first determine completed page count.
+            kv_completed_pages = super()._page_transfer(operation)
 
         # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
         self._page_transfer_sidecar(operation, kv_completed_pages)
@@ -656,13 +692,18 @@ class HybridCacheController(BaseHiCacheController):
         if not operation.is_terminated() and kv_completed_pages == len(
             operation.hash_value
         ):
-            # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
-            # Only handle non-KV-derived sidecar pools here.
-            transfers_nonkv = [
-                transfer
-                for transfer in operation.pool_transfers
-                if transfer.indices_from_pool != PoolName.KV
-            ]
+            # Physical anchors let the base controller batch KV-derived pools
+            # with KV. A logical DSV4 anchor has no primary I/O, so those pools
+            # must be resolved and fetched here as well.
+            transfers_nonkv = (
+                operation.pool_transfers
+                if getattr(self.mem_pool_host, "kv_buffer", None) is None
+                else [
+                    transfer
+                    for transfer in operation.pool_transfers
+                    if transfer.indices_from_pool != PoolName.KV
+                ]
+            )
             self._sync_trailing_keys(
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
@@ -682,6 +723,11 @@ class HybridCacheController(BaseHiCacheController):
         return
 
     def _page_backup(self, operation):
+        # This point is reached after the request has produced cache data. It lets
+        # backends defer runtime-sensitive setup without moving model-specific
+        # lifecycle handling into the controller.
+        self.storage_backend.prepare_for_backup()
+
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -697,28 +743,35 @@ class HybridCacheController(BaseHiCacheController):
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
-        if not self.backup_skip:
+        virtual_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
+        if not self.backup_skip and not virtual_anchor:
             super()._page_backup(operation)
+            if backup_transfers and not self._pool_results_complete(
+                backup_transfers, results
+            ):
+                operation.completed_tokens = 0
         else:
-            sidecar_ok = bool(backup_transfers)
-            if sidecar_ok:
-                for transfer in backup_transfers:
-                    result = results.get(transfer.name)
-                    if result is None:
-                        result = results.get(transfer.name.value)
-                    expected = len(transfer.keys or [])
-                    if expected == 0 and transfer.host_indices is not None:
-                        expected = int(transfer.host_indices.numel())
-                    if (
-                        not isinstance(result, (list, tuple))
-                        or len(result) != expected
-                        or not all(bool(ok) for ok in result)
-                    ):
-                        sidecar_ok = False
-                        break
+            sidecar_ok = bool(backup_transfers) and self._pool_results_complete(
+                backup_transfers, results
+            )
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+
+    @staticmethod
+    def _pool_results_complete(transfers: list[PoolTransfer], results: dict) -> bool:
+        for transfer in transfers:
+            result = results.get(transfer.name)
+            if result is None:
+                result = results.get(transfer.name.value)
+            expected = len(transfer.keys or [])
+            if (
+                not isinstance(result, (list, tuple))
+                or len(result) != expected
+                or not all(bool(ok) for ok in result)
+            ):
+                return False
+        return True
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
@@ -754,8 +807,46 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
+                try:
+                    self._page_backup(operation)
+                except Exception:
+                    operation.completed_tokens = 0
+                    logger.exception(
+                        "HiCache storage backup operation %s failed.", operation.id
+                    )
+                finally:
+                    self.ack_backup_queue.put(operation)
+            except Empty:
+                continue
+
+    def prefetch_io_aux_func(self):
+        """Keep the storage worker alive across individual I/O failures."""
+        while not self.storage_stop_event.is_set():
+            try:
+                operation = self.prefetch_buffer.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+                try:
+                    self._page_transfer(operation)
+                except Exception:
+                    operation.mark_terminate()
+                    operation.pool_transfers_done = True
+                    logger.exception(
+                        "HiCache storage prefetch operation %s failed.",
+                        operation.request_id,
+                    )
+                finally:
+                    # Preserve the base controller's PrefetchAck protocol: the
+                    # terminal ACK must be the last ACK for an operation.  The
+                    # scheduler owns result commit and tail-buffer release after
+                    # consuming this ACK; releasing here races with that commit.
+                    self.prefetch_sync_queue.put(
+                        PrefetchAck(
+                            rid=operation.request_id,
+                            completed_req=True,
+                            operation=operation,
+                        )
+                    )
             except Empty:
                 continue
 
@@ -789,7 +880,59 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.keys is None:
                     transfer.keys = source.keys
             else:
-                pass
+                if transfer.name in (
+                    PoolName.DEEPSEEK_V4_C4,
+                    PoolName.DEEPSEEK_V4_C4_INDEXER,
+                ):
+                    entry = self.mem_pool_host.entry_map.get(transfer.name)
+                    if entry is None:
+                        raise RuntimeError(
+                            f"DSV4 storage pool is not registered: {transfer.name}."
+                        )
+                    transfer.host_indices = self._project_anchor_indices_for_storage(
+                        operation.host_indices,
+                        self.page_size,
+                        entry.host_pool.page_size,
+                    )
+                else:
+                    transfer.host_indices = operation.host_indices
+                if transfer.keys is None:
+                    transfer.keys = operation.hash_value
+
+    @staticmethod
+    def _project_anchor_indices_for_storage(
+        anchor_indices: torch.Tensor,
+        anchor_page_size: int,
+        target_page_size: int,
+    ) -> torch.Tensor:
+        """Project contiguous anchor pages to compact native side-pool pages."""
+        if anchor_page_size <= 0 or target_page_size <= 0:
+            raise ValueError("Storage page sizes must be positive.")
+        if anchor_indices.numel() % anchor_page_size != 0:
+            raise ValueError(
+                f"Anchor indices ({anchor_indices.numel()}) are not aligned to "
+                f"page size {anchor_page_size}."
+            )
+        if anchor_indices.numel() == 0:
+            return anchor_indices.new_empty((0,), dtype=torch.int64)
+        pages = anchor_indices.reshape(-1, anchor_page_size)
+        starts = pages[:, 0]
+        if torch.any(starts % anchor_page_size != 0):
+            raise ValueError("Anchor storage pages must start at a page boundary.")
+        expected = starts[:, None] + torch.arange(
+            anchor_page_size,
+            device=anchor_indices.device,
+            dtype=anchor_indices.dtype,
+        )
+        if not torch.equal(pages, expected):
+            raise ValueError("Anchor storage pages must contain contiguous indices.")
+        page_ids = starts // anchor_page_size
+        offsets = torch.arange(
+            target_page_size,
+            device=anchor_indices.device,
+            dtype=anchor_indices.dtype,
+        )
+        return (page_ids[:, None] * target_page_size + offsets).reshape(-1)
 
     def _sync_trailing_keys(
         self,
@@ -832,6 +975,42 @@ class HybridCacheController(BaseHiCacheController):
                     ]
                 )
                 transfer.host_indices = transfer.host_indices[:needed]
+
+    def _trim_prefetch_transfers(
+        self,
+        pool_transfers: list[PoolTransfer],
+        all_hashes: list[str],
+        kv_hit_pages: int,
+    ) -> None:
+        """Trim preallocated v2 buffers to the prefix selected by exists()."""
+        self._sync_trailing_keys(pool_transfers, all_hashes, kv_hit_pages)
+        for transfer in pool_transfers:
+            if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                continue
+            coverage = transfer.logical_pages_per_object
+            if coverage <= 0:
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' has invalid "
+                    f"logical_pages_per_object={coverage}."
+                )
+            keep_objects = kv_hit_pages // coverage
+            if transfer.keys is not None:
+                transfer.keys = transfer.keys[:keep_objects]
+
+            if transfer.indices_from_pool is not None or transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            keep_slots = keep_objects * entry.host_pool.page_size
+            tail = transfer.host_indices[keep_slots:]
+            transfer.host_indices = transfer.host_indices[:keep_slots]
+            if tail.numel() > 0:
+                self.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(name=transfer.name, host_indices=tail)
+                    ]
+                )
 
     def _apply_kv_anchor_ratio(
         self,

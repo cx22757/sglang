@@ -1468,6 +1468,17 @@ class TestHiCacheArgs(unittest.TestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "ascend_memcache_direct_with_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "ascend_memcache",
+                    "hicache_io_backend": "direct",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "fa3_kernel_with_explicit_decode_backend",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -1492,6 +1503,51 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_mem_layout=case["expected_mem_layout"],
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
+
+    @patch.object(
+        ServerArgs,
+        "get_model_config",
+        return_value=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    @patch.object(ServerArgs, "use_mla_backend", return_value=True)
+    def test_ascend_memcache_mla_uses_kv_split_layout(self, *_mocks):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="ascend_memcache",
+            hicache_io_backend="kernel_ascend",
+            hicache_mem_layout="layer_first",
+        )
+
+        args._handle_hicache()
+
+        self._assert_hicache_fields(
+            args,
+            expected_io_backend="kernel_ascend",
+            expected_mem_layout="page_first_kv_split",
+        )
+
+    @patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=True)
+    @patch.object(
+        ServerArgs,
+        "get_model_config",
+        return_value=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    @patch.object(ServerArgs, "use_mla_backend", return_value=True)
+    def test_ascend_memcache_dsv4_uses_page_first_direct_layout(self, *_mocks):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="ascend_memcache",
+            hicache_io_backend="kernel_ascend",
+            hicache_mem_layout="layer_first",
+        )
+
+        args._handle_hicache()
+
+        self._assert_hicache_fields(
+            args,
+            expected_io_backend="kernel_ascend",
+            expected_mem_layout="page_first_direct",
+        )
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

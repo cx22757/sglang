@@ -228,7 +228,7 @@ class HiCacheHF3FS(HiCacheStorage):
         logger.info(
             f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
             f"file_path={self.file_path}, "
-            f"file_size={self.file_size / (2 ** 30):.2f} GB, "
+            f"file_size={self.file_size / (2**30):.2f} GB, "
             f"num_pages={self.num_pages}, "
             f"is_mla_model={self.is_mla_model}"
         )
@@ -679,7 +679,8 @@ class HiCacheHF3FS(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        kv_pages = self.batch_exists(keys, extra_info)
+        logical_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
+        kv_pages = len(keys) if logical_anchor else self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -694,30 +695,28 @@ class HiCacheHF3FS(HiCacheStorage):
                 final_pages = 0
                 break
 
-            component_keys = [f"{key}_{pool_name}" for key in keys[:kv_pages]]
+            transfer_keys = (
+                list(transfer.keys) if transfer.keys else list(keys[:kv_pages])
+            )
+            component_keys = [f"{key}_{pool_name}" for key in transfer_keys]
             exists_results = self.metadata_client.exists(
                 self.rank, component_keys, namespace=ctx.namespace
             )
 
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = exists_results.index(False)
-                except ValueError:
-                    boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        exists_results[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-
-            if boundary:
-                hit_count[pool_name] = boundary
-            final_pages = min(final_pages, boundary)
+            successful_objects = (
+                exists_results.index(False)
+                if False in exists_results
+                else len(exists_results)
+            )
+            if successful_objects:
+                hit_count[pool_name] = successful_objects
+            if logical_anchor or len(transfer_keys) != kv_pages:
+                if successful_objects != len(transfer_keys):
+                    final_pages = 0
+            elif transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                final_pages = min(final_pages, successful_objects)
+            elif not all(exists_results):
+                final_pages = 0
 
         return PoolTransferResult(final_pages, hit_count)
 

@@ -908,7 +908,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ]
         )
 
-        self.assertIsNone(group.destroy())
+        group.destroy()
+        group.destroy()
+        self.assertEqual(logical_host_pool.available_size(), 0)
 
     def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):
         captured = []
