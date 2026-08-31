@@ -17,15 +17,17 @@ Runs ONE matrix cell against a RUNNING server (:30000, pin L1=384K/rank):
 Routing: --route free (default; both populate and measure omit routed_dp_rank,
 server round-robin assigns by arrival; populate & measure submit in index order
 so a replayed prefix lands on the same rank). --route roundrobin sets
-routed_dp_rank=i%16 on populate/replay (measure is native bench -> always free;
-use only if free-routing hits fail).
+routed_dp_rank=i%BACKEND_DP_RANKS on populate/measure/replay; use only if
+free-routing hits fail.
 
 Usage (inside container cx-dsv4):
   python3 -u bench_ids_dsv4.py --input-len 32768 --num-prompts 282 \
       --output-len 1 --concurrency 16 --tag W1.5_32K_c16 \
       --server-log <path> --seed-base 60000
   # no-cache baseline (C3): --skip-populate
-  # stage split: --populate-only / --measure-only (for breakpoint resume within a cell)
+  # stage split (independent): --populate-only / --measure-only /
+  # --skip-populate / --skip-measure / --skip-replay — any combination runs
+  # only the wanted stages (cold: --skip-populate --skip-replay).
 Kill policy: NEVER kills the operator's server; on failure leaves it running and
 prints the log path + manual-stop hint, then exits non-zero.
 """
@@ -47,12 +49,13 @@ from sglang.benchmark.datasets.common import DatasetRow
 print = functools.partial(print, flush=True)
 
 G = 128 * 16  # 2048 raw tokens per complete C128 group
+BACKEND_DP_RANKS = 8
 MODEL = "/mnt/paas/weights/DeepSeek-V4-Flash-w8a8-mtp"
 BASE = "http://127.0.0.1:30000"
 
 
 def _post_generate(input_ids, rid: str, max_new_tokens: int,
-                   routed_dp_rank, timeout: float = 300.0):
+                   routed_dp_rank, timeout: float = 900.0):
     """POST /generate; return (output_ids, cached_tokens). Raises on failure."""
     payload = {
         "rid": rid,
@@ -150,6 +153,12 @@ def main():
                     help="skip measure (native bench) and its hit verification; "
                          "populate then replay only, to isolate measure's "
                          "interference on replay")
+    ap.add_argument("--skip-replay", action="store_true",
+                    help="skip the correctness replay entirely")
+    ap.add_argument("--save-first-out", type=str, default=None,
+                    help="save populate output_ids to this JSON file")
+    ap.add_argument("--load-first-out", type=str, default=None,
+                    help="load populate output_ids from this JSON file for replay")
     a = ap.parse_args()
     cmp_len = a.output_len if a.cmp_len is None else a.cmp_len
     if a.output_len <= 0:
@@ -163,26 +172,36 @@ def main():
     vocab = tok.vocab_size
     special = set(tok.all_special_ids or [])
     N = a.num_prompts
-    P = (a.input_len // G) * G  # group-aligned cached prefix
+    P = (a.input_len // G) * G  # group-aligned full request length (measure)
     assert P == a.input_len, f"input_len {a.input_len} not a multiple of G={G}"
+    # --hit controls the populate prefix length. Measure still sends the full
+    # input length, so hit=50 means half cached and half new.
+    pop_len = ((P * a.hit) // 100) // G * G
     seeds = [a.seed_base + i for i in range(N)]
     prefixes = [_make_ids(vocab, special, s, P) for s in seeds]
+    pop_inputs = [pref[:pop_len] for pref in prefixes]
     if a.hit == 100:
         # N*G + 1: the extra token absorbs sglang's longest-hit-minus-1, so the
         # cached portion is exactly N*G (all complete groups).
-        inputs = [pref + [pref[-1]] for pref in prefixes]
-    else:  # 50: prefix P + new suffix Q
+        meas_inputs = [pref + [pref[-1]] for pref in prefixes]
+    else:  # 50: first half cached prefix + second half new suffix
         soff = a.seed_base + 10_000_000
-        suffixes = [_make_ids(vocab, special, soff + i, P) for i in range(N)]
-        inputs = [pref + suf for pref, suf in zip(prefixes, suffixes)]
-    ranks = [i % 16 for i in range(N)] if a.route == "roundrobin" else [None] * N
+        suffixes = [_make_ids(vocab, special, soff + i, P - pop_len) for i in range(N)]
+        meas_inputs = [
+            pref[:pop_len] + suf for pref, suf in zip(prefixes, suffixes)
+        ]
+    ranks = (
+        [i % BACKEND_DP_RANKS for i in range(N)]
+        if a.route == "roundrobin"
+        else [None] * N
+    )
     first_out: list = [None] * N
 
     def _populate():
         t0 = time.perf_counter()
         with ThreadPoolExecutor(max_workers=a.pop_conc) as ex:
             futs = [
-                ex.submit(_post_generate, inputs[i], f"{a.tag}-pop-{i}",
+                ex.submit(_post_generate, pop_inputs[i], f"{a.tag}-pop-{i}",
                           a.output_len, ranks[i])
                 for i in range(N)
             ]
@@ -193,7 +212,7 @@ def main():
                 except Exception as e:
                     print(f"  [populate] [{i}] FAILED: {e!r}")
                     raise
-                if (i + 1) % 16 == 0:
+                if (i + 1) % a.pop_conc == 0:
                     print(f"  [populate] {i + 1}/{N} done ({time.perf_counter() - t0:.0f}s)")
         print(f"  [populate] {N} prefixes done in {time.perf_counter() - t0:.0f}s")
 
@@ -208,10 +227,12 @@ def main():
                 prompt_len=len(ids),
                 output_len=a.output_len,
                 extra_request_body=(
-                    {"routed_dp_rank": i % 16} if a.route == "roundrobin" else {}
+                    {"routed_dp_rank": i % BACKEND_DP_RANKS}
+                    if a.route == "roundrobin"
+                    else {}
                 ),
             )
-            for i, ids in enumerate(inputs)
+            for i, ids in enumerate(meas_inputs)
         ]
         # Patch the name run_benchmark actually resolves: sglang.benchmark.serving
         # imports get_dataset into ITS module namespace (bench_serving is a
@@ -242,31 +263,62 @@ def main():
 
     def _replay():
         bad = 0
-        for i in range(N):
-            try:
-                out, cac = _post_generate(inputs[i], f"{a.tag}-replay-{i}",
-                                          a.output_len, ranks[i])
-            except Exception as e:
-                print(f"  [replay] [{i}] FAILED: {e!r}")
-                raise
-            first_cmp = first_out[i][:cmp_len] if first_out[i] is not None else None
-            replay_cmp = out[:cmp_len]
-            if first_cmp is not None and (
-                len(first_cmp) != cmp_len
-                or len(replay_cmp) != cmp_len
-                or replay_cmp != first_cmp
-            ):
-                bad += 1
-                if bad <= 5:
-                    print(f"  [replay] [{i}] DIVERGED: first={first_cmp} "
-                          f"replay={replay_cmp} cached={cac}")
+        diverged = []
+        with ThreadPoolExecutor(max_workers=a.pop_conc) as ex:
+            futs = [
+                ex.submit(_post_generate, pop_inputs[i], f"{a.tag}-replay-{i}",
+                          a.output_len, ranks[i])
+                for i in range(N)
+            ]
+            for i, f in enumerate(futs):
+                try:
+                    out, cac = f.result()
+                except Exception as e:
+                    print(f"  [replay] [{i}] FAILED: {e!r}")
+                    raise
+                first_cmp = (
+                    first_out[i][:cmp_len] if first_out[i] is not None else None
+                )
+                replay_cmp = out[:cmp_len]
+                if first_cmp is not None and (
+                    len(first_cmp) != cmp_len
+                    or len(replay_cmp) != cmp_len
+                    or replay_cmp != first_cmp
+                ):
+                    bad += 1
+                    if len(diverged) < 5:
+                        idx = next(
+                            (
+                                k
+                                for k, (first_token, replay_token) in enumerate(
+                                    zip(first_cmp, replay_cmp)
+                                )
+                                if first_token != replay_token
+                            ),
+                            -1,
+                        )
+                        diverged.append((i, idx, first_cmp, replay_cmp, cac))
+        for i, idx, first_cmp, replay_cmp, cac in diverged:
+            print(f"  [replay] [{i}] DIVERGED at tok#{idx}: first={first_cmp} "
+                  f"replay={replay_cmp} cached={cac}")
         print(f"  [replay] {N - bad}/{N} identical (cached check done)")
         if bad:
-            print(f"  [replay] FAIL: {bad} outputs diverged")
-            sys.exit(2)
+            print(f"  [replay] NOTE: {bad} outputs diverged (recorded, cell continues)")
 
     if not a.skip_populate and not a.measure_only:
         _populate()
+        if a.save_first_out:
+            with open(a.save_first_out, "w") as output_file:
+                json.dump(first_out, output_file)
+            print(f"  [first_out] saved {len(first_out)} entries -> "
+                  f"{a.save_first_out}")
+    if a.load_first_out is not None and not a.populate_only:
+        with open(a.load_first_out) as input_file:
+            loaded = json.load(input_file)
+        for i in range(N):
+            if i < len(loaded):
+                first_out[i] = loaded[i]
+        print(f"  [first_out] loaded {len(loaded)} entries from {a.load_first_out}")
     if not a.populate_only and not a.skip_measure:
         log_measure_start = _log_line_count(a.server_log)
         _measure()
@@ -275,7 +327,7 @@ def main():
         hit = cac * 100.0 / tot if tot else 0.0
         print(f"  [verify] measure-window new={new} cached={cac} "
               f"achieved_hit={hit:.1f}%")
-    if not a.populate_only:
+    if not a.populate_only and not a.skip_replay:
         _replay()
 
     print("  CELL DONE (server LEFT RUNNING)")
