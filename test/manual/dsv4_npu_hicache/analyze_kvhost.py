@@ -1,95 +1,117 @@
 #!/usr/bin/env python3
-"""Compare host-side C4/C128 digests: backup (pre-Mooncake) vs prefetch (post-Mooncake).
-
-backup_digest == prefetch_digest  -> Mooncake round-trip bitwise correct;
-                                     corruption is in D2H (backup side) or H2D (prefetch side)
-backup_digest != prefetch_digest  -> Mooncake write or read corrupts data
+"""Compare per-key host bytes before Mooncake PUT and after Mooncake GET.
 
 Usage:
   python3 -u analyze_kvhost.py <server.log>
 
-The log must contain [KVHOST] lines produced with SGLANG_DSV4_KV_DIGEST=1.
+Enable logs with SGLANG_DSV4_KV_DIGEST=1.
 """
+
 import re
 import sys
 from collections import defaultdict
 
-print = __import__("functools").partial(print, flush=True)
-
 _LINE = re.compile(
-    r"\[KVHOST\] phase=(?P<phase>\S+) pool=(?P<pool>\S+) "
-    r"key0=(?P<key0>\S+) nkeys=(?P<nkeys>\d+) digest=(?P<digest>\S+)"
+    r"\[KVHOST\] phase=(?P<phase>put|get) rank=(?P<rank>\d+) "
+    r"pp=(?P<pp>\d+) pool=(?P<pool>\S+) key=(?P<key>\S+) "
+    r"action=(?P<action>\S+) bytes=(?P<bytes>\d+) "
+    r"result=(?P<result>-?\d+) digest=(?P<digest>\S+)"
 )
-
-# prefetch phase names for KV-derived (C4) and sidecar (C128)
-_PREFETCH_PHASES = {"prefetch_kv", "prefetch_sidecar"}
 
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) != 2:
         print("usage: analyze_kvhost.py <server.log>")
-        sys.exit(1)
+        sys.exit(2)
 
-    # records[(pool, key0)] = {"backup": digest, "prefetch": digest}
-    # keep last occurrence per (pool, key0, phase)
-    records: dict = defaultdict(dict)
+    puts = {}
+    skipped = set()
+    gets = []
 
-    with open(sys.argv[1], errors="ignore") as f:
-        for line in f:
-            m = _LINE.search(line)
-            if not m:
+    with open(sys.argv[1], errors="ignore") as log_file:
+        for line in log_file:
+            match = _LINE.search(line)
+            if not match:
                 continue
-            phase = m.group("phase")
-            pool = m.group("pool")
-            key0 = m.group("key0")
-            digest = m.group("digest")
-            bucket = "prefetch" if phase in _PREFETCH_PHASES else phase
-            records[(pool, key0)][bucket] = digest
+            record = match.groupdict()
+            identity = (
+                record["rank"],
+                record["pp"],
+                record["pool"],
+                record["key"],
+            )
+            value = (int(record["bytes"]), record["digest"])
+            if record["phase"] == "put":
+                if record["action"] == "created":
+                    puts.setdefault(identity, value)
+                elif record["action"] == "skipped_exists":
+                    skipped.add(identity)
+            else:
+                gets.append(
+                    (
+                        identity,
+                        record["action"],
+                        int(record["result"]),
+                        value,
+                    )
+                )
 
-    if not records:
-        print("No [KVHOST] lines found in log.")
+    if not puts and not gets:
+        print("No new-format [KVHOST] lines found.")
         sys.exit(2)
 
-    total = diffs = errors = missing = 0
-    by_pool: dict = defaultdict(lambda: {"diffs": 0, "total": 0})
+    compared = 0
+    diffs = 0
+    io_errors = 0
+    unverified = 0
+    by_pool = defaultdict(lambda: [0, 0])
 
-    for (pool, key0), phases in sorted(records.items()):
-        backup = phases.get("backup")
-        prefetch = phases.get("prefetch")
-        if backup is None or prefetch is None:
-            missing += 1
+    for identity, action, result, get_value in gets:
+        rank, pp, pool, key = identity
+        byte_count, digest = get_value
+        if action != "read" or result != byte_count or digest.startswith("ERR:"):
+            io_errors += 1
+            print(
+                f"IO_ERROR rank={rank} pp={pp} pool={pool} key={key} "
+                f"action={action} bytes={byte_count} result={result} digest={digest}"
+            )
             continue
-        total += 1
-        by_pool[pool]["total"] += 1
-        if backup.startswith("ERR") or prefetch.startswith("ERR"):
-            errors += 1
-            print(f"  ERR  pool={pool} key0={key0} backup={backup} prefetch={prefetch}")
-        elif backup != prefetch:
+
+        put_value = puts.get(identity)
+        if put_value is None:
+            unverified += 1
+            reason = "skipped_exists" if identity in skipped else "missing_put"
+            print(
+                f"UNVERIFIED rank={rank} pp={pp} pool={pool} "
+                f"key={key} reason={reason}"
+            )
+            continue
+
+        compared += 1
+        by_pool[pool][1] += 1
+        if put_value != get_value:
             diffs += 1
-            by_pool[pool]["diffs"] += 1
-            print(f"  DIFF pool={pool} key0={key0} backup={backup} prefetch={prefetch}")
+            by_pool[pool][0] += 1
+            print(
+                f"DIFF rank={rank} pp={pp} pool={pool} key={key} "
+                f"put={put_value} get={get_value}"
+            )
 
-    print("-" * 60)
-    for pool, stats in sorted(by_pool.items()):
-        print(f"  {pool}: {stats['diffs']}/{stats['total']} diffs")
-    print(f"\npairs_compared={total} diffs={diffs} errors={errors} missing_half={missing}")
+    print("-" * 72)
+    for pool, (pool_diffs, pool_total) in sorted(by_pool.items()):
+        print(f"{pool}: {pool_diffs}/{pool_total} diffs")
+    print(
+        f"compared={compared} diffs={diffs} io_errors={io_errors} "
+        f"unverified={unverified}"
+    )
 
-    if diffs:
-        print(
-            "\nRESULT: Mooncake corrupts data in write or read path\n"
-            "  -> bug is between host pool and Mooncake (batch_set_v2 or batch_get_v2)"
-        )
+    if diffs or io_errors:
+        print("RESULT: KVHOST mismatch or incomplete Mooncake I/O")
         sys.exit(1)
-    elif total == 0:
-        print("\nRESULT: no backup/prefetch pairs to compare (check log filtering)")
+    if compared == 0 or unverified:
+        print("RESULT: inconclusive; use a fresh extra_backend_tag and rerun")
         sys.exit(2)
-    else:
-        print(
-            "\nRESULT: Mooncake round-trip bitwise correct\n"
-            "  -> corruption is in D2H (device->host before backup)\n"
-            "  or H2D (host->device after prefetch)"
-        )
-        sys.exit(0)
+    print("RESULT: host -> Mooncake -> host bytes are exact")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -910,6 +911,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     key_strs, ptr_list, element_size_list
                 )
 
+            kvhost_debug = envs.SGLANG_DSV4_KV_DIGEST.get()
+
             if is_set:
                 group_ids = (
                     self._expand_group_ids(tagged_keys, key_multiplier)
@@ -919,6 +922,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+                put_digests = (
+                    [
+                        self._kvhost_digest(ptr_list[i], element_size_list[i])
+                        for i in range(len(key_strs))
+                    ]
+                    if kvhost_debug
+                    else None
+                )
                 if missing_idx:
                     put_results = self._put_batch_zero_copy_impl(
                         [key_strs[i] for i in missing_idx],
@@ -928,10 +939,45 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
+                if kvhost_debug:
+                    for i, key in enumerate(key_strs):
+                        result = int(io_results[i])
+                        if exist_result[i] == 1:
+                            action = "skipped_exists"
+                        elif result == 0:
+                            action = "created"
+                        else:
+                            action = "failed"
+                        byte_count, digest = put_digests[i]
+                        self._log_kvhost(
+                            phase="put",
+                            pool=transfer.name,
+                            key=key,
+                            action=action,
+                            byte_count=byte_count,
+                            result=result,
+                            digest=digest,
+                        )
             else:
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
                 )
+                if kvhost_debug:
+                    for i, key in enumerate(key_strs):
+                        byte_count, digest = self._kvhost_digest(
+                            ptr_list[i], element_size_list[i]
+                        )
+                        result = int(io_results[i])
+                        action = "read" if result == byte_count else "failed"
+                        self._log_kvhost(
+                            phase="get",
+                            pool=transfer.name,
+                            key=key,
+                            action=action,
+                            byte_count=byte_count,
+                            result=result,
+                            digest=digest,
+                        )
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
             )
@@ -968,6 +1014,55 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     @staticmethod
     def _uses_multi_buffer(buffer_ptrs: List[Any]) -> bool:
         return bool(buffer_ptrs) and isinstance(buffer_ptrs[0], Sequence)
+
+    @staticmethod
+    def _kvhost_as_list(value: Any) -> List[Any]:
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return list(value)
+        return [value]
+
+    @classmethod
+    def _kvhost_digest(cls, buffer_ptrs: Any, buffer_sizes: Any) -> tuple[int, str]:
+        ptrs = [int(ptr) for ptr in cls._kvhost_as_list(buffer_ptrs)]
+        sizes = [int(size) for size in cls._kvhost_as_list(buffer_sizes)]
+        if len(ptrs) != len(sizes):
+            return sum(sizes), "ERR:pointer_size_mismatch"
+        try:
+            digest = hashlib.sha256()
+            for ptr, size in zip(ptrs, sizes):
+                digest.update(size.to_bytes(8, "little", signed=False))
+                if size:
+                    digest.update((ctypes.c_ubyte * size).from_address(ptr))
+            return sum(sizes), digest.hexdigest()
+        except Exception as exc:  # noqa: BLE001
+            return sum(sizes), f"ERR:{type(exc).__name__}"
+
+    def _log_kvhost(
+        self,
+        *,
+        phase: str,
+        pool: PoolName,
+        key: str,
+        action: str,
+        byte_count: int,
+        result: int,
+        digest: str,
+    ) -> None:
+        logger.warning(
+            "[KVHOST] phase=%s rank=%d pp=%d pool=%s key=%s "
+            "action=%s bytes=%d result=%d digest=%s",
+            phase,
+            self.local_rank,
+            self.pp_rank,
+            pool,
+            key,
+            action,
+            byte_count,
+            result,
+            digest,
+        )
 
     @staticmethod
     def _pack_multi_buffer_meta(
