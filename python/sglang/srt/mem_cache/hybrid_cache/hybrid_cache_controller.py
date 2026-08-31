@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
     count_pool_hits,
 )
-from sglang.srt import envs
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
