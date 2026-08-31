@@ -17,13 +17,13 @@ Runs ONE matrix cell against a RUNNING server (:30000, pin L1=384K/rank):
 Routing: --route free (default; both populate and measure omit routed_dp_rank,
 server round-robin assigns by arrival; populate & measure submit in index order
 so a replayed prefix lands on the same rank). --route roundrobin sets
-routed_dp_rank=i%BACKEND_DP_RANKS on populate/measure/replay; use only if
+routed_dp_rank=i%dp_ranks on populate/measure/replay; use only if
 free-routing hits fail.
 
 Usage (inside container cx-dsv4):
   python3 -u bench_ids_dsv4.py --input-len 32768 --num-prompts 282 \
       --output-len 1 --concurrency 16 --tag W1.5_32K_c16 \
-      --server-log <path> --seed-base 60000
+      --server-log <path> --seed-base 60000 --model-path <model-dir>
   # no-cache baseline (C3): --skip-populate
   # stage split (independent): --populate-only / --measure-only /
   # --skip-populate / --skip-measure / --skip-replay — any combination runs
@@ -49,7 +49,6 @@ from sglang.benchmark.datasets.common import DatasetRow
 print = functools.partial(print, flush=True)
 
 G = 128 * 16  # 2048 raw tokens per complete C128 group
-BACKEND_DP_RANKS = 8
 MODEL = "/mnt/paas/weights/DeepSeek-V4-Flash-w8a8-mtp"
 BASE = "http://127.0.0.1:30000"
 
@@ -60,7 +59,11 @@ def _post_generate(input_ids, rid: str, max_new_tokens: int,
     payload = {
         "rid": rid,
         "input_ids": [int(x) for x in input_ids],
-        "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens},
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
+        },
         "return_logprob": False,
     }
     if routed_dp_rank is not None:
@@ -133,6 +136,8 @@ def main():
     ap.add_argument("--input-len", type=int, required=True,
                     help="group-aligned cached prefix length P = N*G (request "
                          "input = P+1 for hit=100; = P+Q for hit=50).")
+    ap.add_argument("--model-path", required=True,
+                    help="local model/tokenizer directory")
     ap.add_argument("--num-prompts", type=int, required=True)
     ap.add_argument("--output-len", type=int, required=True, help="1 or 1024")
     ap.add_argument("--cmp-len", type=int, default=None,
@@ -144,6 +149,8 @@ def main():
     ap.add_argument("--server-log", required=True)
     ap.add_argument("--seed-base", type=int, default=60000)
     ap.add_argument("--route", choices=["free", "roundrobin"], default="free")
+    ap.add_argument("--dp-ranks", type=int, default=16,
+                    help="backend DP rank count for roundrobin routing (default: 16)")
     ap.add_argument("--pop-conc", type=int, default=8,
                     help="concurrency of the populate loop")
     ap.add_argument("--skip-populate", action="store_true", help="C3 no-cache")
@@ -163,12 +170,14 @@ def main():
     cmp_len = a.output_len if a.cmp_len is None else a.cmp_len
     if a.output_len <= 0:
         ap.error("--output-len must be positive")
+    if a.dp_ranks <= 0:
+        ap.error("--dp-ranks must be positive")
     if not 1 <= cmp_len <= a.output_len:
         ap.error("--cmp-len must satisfy 1 <= cmp-len <= output-len")
 
     # ---- input generation (deterministic distinct) ----
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(a.model_path, trust_remote_code=True)
     vocab = tok.vocab_size
     special = set(tok.all_special_ids or [])
     N = a.num_prompts
@@ -191,7 +200,7 @@ def main():
             pref[:pop_len] + suf for pref, suf in zip(prefixes, suffixes)
         ]
     ranks = (
-        [i % BACKEND_DP_RANKS for i in range(N)]
+        [i % a.dp_ranks for i in range(N)]
         if a.route == "roundrobin"
         else [None] * N
     )
@@ -227,7 +236,7 @@ def main():
                 prompt_len=len(ids),
                 output_len=a.output_len,
                 extra_request_body=(
-                    {"routed_dp_rank": i % BACKEND_DP_RANKS}
+                    {"routed_dp_rank": i % a.dp_ranks}
                     if a.route == "roundrobin"
                     else {}
                 ),
@@ -240,7 +249,7 @@ def main():
         serving.get_dataset = lambda args, tokenizer, model_id=None: rows
         args = SimpleNamespace(
             backend="sglang", base_url=BASE, host="127.0.0.1", port=30000,
-            model=MODEL, served_model_name=None, tokenizer=None,
+            model=a.model_path, served_model_name=None, tokenizer=None,
             dataset_name="custom", dataset_path="", num_prompts=N,
             request_rate=float("inf"), max_concurrency=a.concurrency, seed=1,
             ready_check_timeout_sec=60,
