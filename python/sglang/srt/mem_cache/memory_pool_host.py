@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from typing import Optional
@@ -50,6 +51,25 @@ from sglang.srt.mem_cache.pool_host.common import (
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 # ---- V4 Compressed KV Host Pools ----
+
+
+def _debug_tensor_digest(tensors) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    total = 0
+    for tensor in tensors:
+        raw = tensor.detach().contiguous().cpu().view(torch.uint8)
+        size = raw.numel()
+        total += size
+        digest.update(size.to_bytes(8, "little", signed=False))
+        digest.update(raw.numpy().tobytes())
+    return total, digest.hexdigest()
+
+
+def _debug_rows_signature(rows: list[int]) -> str:
+    if not rows:
+        return "0:none:none:none"
+    digest = hashlib.sha256(",".join(str(row) for row in rows).encode()).hexdigest()
+    return f"{len(rows)}:{rows[0]}:{rows[-1]}:{digest[:16]}"
 
 
 class LogicalHostPool:
@@ -409,6 +429,41 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+
+    def debug_transfer_digest(
+        self, indices: torch.Tensor, *, from_host: bool
+    ) -> tuple[int, str, str]:
+        rows = [int(row) for row in self._to_page_indices(indices).tolist()]
+        rows_cpu = torch.tensor(rows, dtype=torch.int64)
+        rows_device = rows_cpu.to(self.gpu_device) if not from_host else None
+        tensors = []
+        for layer_id in range(self.layer_num):
+            if from_host:
+                source = (
+                    self.kv_buffer[layer_id]
+                    if self.layout == "layer_first"
+                    else self.kv_buffer[:, layer_id]
+                )
+                tensor = source.index_select(0, rows_cpu)
+            else:
+                source = self.device_buffers[layer_id]
+                tensor = source.index_select(0, rows_device)
+            tensors.append(tensor)
+        if self.scale_device_buffers is not None:
+            for layer_id in range(self.layer_num):
+                if from_host:
+                    source = (
+                        self.scale_kv_buffer[layer_id]
+                        if self.layout == "layer_first"
+                        else self.scale_kv_buffer[:, layer_id]
+                    )
+                    tensor = source.index_select(0, rows_cpu)
+                else:
+                    source = self.scale_device_buffers[layer_id]
+                    tensor = source.index_select(0, rows_device)
+                tensors.append(tensor)
+        byte_count, digest = _debug_tensor_digest(tensors)
+        return byte_count, digest, _debug_rows_signature(rows)
 
     def _has_transfer_indices(
         self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
@@ -925,6 +980,28 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 f"got numel={indices.numel()}, swa_page_size={self.swa_page_size}"
             )
         return indices.reshape(-1, self.swa_page_size)[:, 0] // self.swa_page_size
+
+    def debug_transfer_digest(
+        self, indices: torch.Tensor, *, from_host: bool
+    ) -> tuple[int, str, str]:
+        rows = [int(row) for row in self._to_page_indices(indices).tolist()]
+        rows_cpu = torch.tensor(rows, dtype=torch.int64)
+        rows_device = rows_cpu.to(self.gpu_device) if not from_host else None
+        tensors = []
+        for layer_id in range(self.layer_num):
+            if from_host:
+                source = (
+                    self.kv_buffer[layer_id]
+                    if self.layout == "layer_first"
+                    else self.kv_buffer[:, layer_id]
+                )
+                tensor = source.index_select(0, rows_cpu)
+            else:
+                source = self.device_page_views[layer_id]
+                tensor = source.index_select(0, rows_device)
+            tensors.append(tensor)
+        byte_count, digest = _debug_tensor_digest(tensors)
+        return byte_count, digest, _debug_rows_signature(rows)
 
     def _ring_op_indices(self, rows: torch.Tensor) -> torch.Tensor:
         """Expand each SWA page row into ``ring_size`` operator indices.

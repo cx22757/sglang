@@ -28,6 +28,9 @@ _LINE = re.compile(
     r"ntok=(?P<ntok>\d+) swa=(?P<swa>\S+) c4=(?P<c4>\S+) c128=(?P<c128>\S+)"
     r"(?:\s+state=(?P<state>\S+))?(?:\s+idx=(?P<idx>\S+))?"
     r"(?:\s+sidecar=(?P<sidecar>\S+))?"
+    r"(?:\s+swabt=(?P<swabt>\S+))?"
+    r"(?:\s+c4bt=(?P<c4bt>\S+))?(?:\s+c128bt=(?P<c128bt>\S+))?"
+    r"(?:\s+idxbt=(?P<idxbt>\S+))?"
 )
 _RID = re.compile(r"-(?P<kind>pop|replay)-(\d+)$")
 
@@ -77,7 +80,9 @@ def parse(path: str, rid_filter: str):
             ntok = int(m.group("ntok"))
             vals = (ntok, m.group("swa"), m.group("c4"), m.group("c128"),
                     m.group("state") or "None", m.group("idx") or "None",
-                    m.group("sidecar") or "None")
+                    m.group("sidecar") or "None", m.group("swabt") or "None",
+                    m.group("c4bt") or "None", m.group("c128bt") or "None",
+                    m.group("idxbt") or "None")
             cur = data[i][kind][phase].get(layer)
             if cur is None or ntok > cur[0]:
                 data[i][kind][phase][layer] = vals
@@ -93,7 +98,10 @@ def _cmp_vals(a, b):
         return "MISSING", "MISSING"
     if a[0] != b[0]:
         return "DIFF", f"ntok-DIFF ({a[0]} vs {b[0]})"
-    fields = ("swa", "c4", "c128", "state", "idx", "sidecar")
+    fields = (
+        "swa", "c4", "c128", "state", "idx", "sidecar",
+        "swabt", "c4bt", "c128bt", "idxbt",
+    )
     statuses = []
     parts = []
     for name, x, y in zip(fields, a[1:], b[1:]):

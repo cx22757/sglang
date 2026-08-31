@@ -927,6 +927,70 @@ class DeepseekV4AscendAttnBackend(
         except Exception as e:  # noqa: BLE001
             return f"ERR:{type(e).__name__}"
 
+    def _kv_comp_block_table_digest(
+        self, layer_id: int, batch_idx: int, ntok: int, ratio: int
+    ):
+        """Digest the compressed KV pages actually referenced by the kernel."""
+        try:
+            num_slots = ntok // ratio
+            if num_slots == 0:
+                return None
+            data = self.token_to_kv_pool.get_compress_buffer(
+                layer_id, False
+            )
+            page_size = data.shape[1]
+            num_pages = (num_slots + page_size - 1) // page_size
+            page_table = getattr(self.forward_metadata, f"c{ratio}_page_table")
+            pages = page_table[batch_idx, :num_pages].to(torch.int64)
+            selected = data.index_select(0, pages).flatten(0, 1)[:num_slots]
+            return self._kv_digest_sum(selected)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
+    def _kv_swa_block_table_digest(
+        self, layer_id: int, batch_idx: int, ntok: int
+    ):
+        """Digest the SWA pages actually referenced by the attention kernel."""
+        try:
+            data = self.token_to_kv_pool.get_swa_buffer(layer_id)
+            num_slots = min(ntok, self._dsv4_sliding_window_size)
+            page_size = data.shape[1]
+            num_pages = (num_slots + page_size - 1) // page_size
+            pages = self.forward_metadata.swa_page_table[
+                batch_idx, :num_pages
+            ].to(torch.int64)
+            selected = data.index_select(0, pages).flatten(0, 1)[:num_slots]
+            return self._kv_digest_sum(selected)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
+    def _kv_indexer_block_table_digest(
+        self, layer_id: int, batch_idx: int, ntok: int
+    ):
+        try:
+            num_slots = ntok // 4
+            if num_slots == 0:
+                return None
+            pool = self.token_to_kv_pool
+            item = pool.layer_mapping[layer_id]
+            cidx = item.compress_layer_id
+            idx_pool = pool.c4_indexer_kv_pool
+            ik = idx_pool.get_index_k(cidx)
+            isc = idx_pool.get_index_scale(cidx)
+            page_size = ik.shape[1]
+            num_pages = (num_slots + page_size - 1) // page_size
+            pages = self.forward_metadata.c4_page_table[
+                batch_idx, :num_pages
+            ].to(torch.int64)
+            ik_data = ik.index_select(0, pages).flatten(0, 1)[:num_slots]
+            isc_data = isc.index_select(0, pages).flatten(0, 1)[:num_slots]
+            return (
+                f"ik={self._kv_digest_sum(ik_data)};"
+                f"is={self._kv_digest_sum(isc_data)}"
+            )
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
     def _kv_digest(self, forward_batch, layer_id: int, phase: str) -> None:
         """Emit [KVSUM] digest lines to server.log (SGLANG_DSV4_KV_DIGEST=1).
 
@@ -986,12 +1050,25 @@ class DeepseekV4AscendAttnBackend(
                     if swa_sum is None:
                         swa_sum = f"ERR:{type(e).__name__}"
                 c4_sum = c128_sum = idx_sum = sidecar_sum = None
+                swabt_sum = self._kv_swa_block_table_digest(
+                    layer_id, b, ntok
+                )
+                c4bt_sum = c128bt_sum = idxbt_sum = None
                 if ratio == 4:
                     c4_sum = self._kv_comp_digest(layer_id, full_locs, 4)
                     idx_sum = self._kv_indexer_digest(layer_id, full_locs)
+                    c4bt_sum = self._kv_comp_block_table_digest(
+                        layer_id, b, ntok, 4
+                    )
+                    idxbt_sum = self._kv_indexer_block_table_digest(
+                        layer_id, b, ntok
+                    )
                 elif ratio == 128:
                     c128_sum = self._kv_c128_digest(layer_id, ntok, req_pool64[b])
                     sidecar_sum = self._kv_c128_sidecar_digest(req_pool64[b], ntok)
+                    c128bt_sum = self._kv_comp_block_table_digest(
+                        layer_id, b, ntok, 128
+                    )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "[KVSUM] phase=%s rid=%s layer=%d ntok=%d err=%s:%s",
@@ -1000,9 +1077,10 @@ class DeepseekV4AscendAttnBackend(
                 continue
             logger.warning(
                 "[KVSUM] phase=%s rid=%s layer=%d ntok=%d swa=%s c4=%s c128=%s "
-                "state=%s idx=%s sidecar=%s",
+                "state=%s idx=%s sidecar=%s swabt=%s c4bt=%s c128bt=%s idxbt=%s",
                 phase, rid, layer_id, ntok,
                 swa_sum, c4_sum, c128_sum, state_sum, idx_sum, sidecar_sum,
+                swabt_sum, c4bt_sum, c128bt_sum, idxbt_sum,
             )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:

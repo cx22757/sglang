@@ -914,6 +914,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             kvhost_debug = envs.SGLANG_DSV4_KV_DIGEST.get()
 
             if is_set:
+                if kvhost_debug:
+                    self._log_kvpool_snapshot(
+                        "put", host_pool, host_indices, key_strs
+                    )
                 group_ids = (
                     self._expand_group_ids(tagged_keys, key_multiplier)
                     if self._can_use_group_semantics()
@@ -963,6 +967,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     key_strs, ptr_list, element_size_list
                 )
                 if kvhost_debug:
+                    self._log_kvpool_snapshot(
+                        "get", host_pool, host_indices, key_strs
+                    )
                     for i, key in enumerate(key_strs):
                         byte_count, digest = self._kvhost_digest(
                             ptr_list[i], element_size_list[i]
@@ -1061,6 +1068,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             action,
             byte_count,
             result,
+            digest,
+        )
+
+    def _log_kvpool_snapshot(
+        self,
+        phase: str,
+        host_pool: Any,
+        host_indices: torch.Tensor,
+        key_strs: List[str],
+    ) -> None:
+        digest_fn = getattr(host_pool, "debug_transfer_digest", None)
+        if digest_fn is None:
+            return
+        key_sig = hashlib.sha256("\0".join(key_strs).encode()).hexdigest()[:16]
+        try:
+            byte_count, digest, rows = digest_fn(host_indices, from_host=True)
+        except Exception as exc:  # noqa: BLE001
+            byte_count, digest, rows = 0, f"ERR:{type(exc).__name__}", "error"
+        logger.warning(
+            "[KVPOOL] phase=%s rank=%d pp=%d pool=%s key_sig=%s "
+            "keys=%d rows=%s bytes=%d digest=%s",
+            phase,
+            self.local_rank,
+            self.pp_rank,
+            getattr(host_pool, "pool_name", "unknown"),
+            key_sig,
+            len(key_strs),
+            rows,
+            byte_count,
             digest,
         )
 
