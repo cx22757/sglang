@@ -716,18 +716,27 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def get_page_buffer_meta(self, indices):
         ptr_list = []
+        size_list = []
         rows = self._to_page_indices(indices).tolist()
         if self.layout == "layer_first":
+            k_elem = self.item_bytes * self.dtype.itemsize
+            sc_elem = self.scale_item_bytes  # already in bytes; 0 if no scale
             for row in rows:
                 page_index = int(row)
                 for layer_id in range(self.layer_num):
-                    ptr = (
+                    ptr_list.append(
                         self.kv_buffer[layer_id].data_ptr()
-                        + page_index * self.item_bytes * self.dtype.itemsize
+                        + page_index * k_elem
                     )
-                    ptr_list.append(ptr)
-            element_size = self.item_bytes * self.dtype.itemsize
-            return ptr_list, [element_size] * len(ptr_list)
+                    size_list.append(k_elem)
+                if sc_elem > 0 and self.scale_kv_buffer is not None:
+                    for layer_id in range(self.layer_num):
+                        ptr_list.append(
+                            self.scale_kv_buffer[layer_id].data_ptr()
+                            + page_index * sc_elem
+                        )
+                        size_list.append(sc_elem)
+            return ptr_list, size_list
         if self.layout in ["page_first", "page_first_direct"]:
             page_bytes = self.layer_num * self.item_bytes * self.dtype.itemsize
             for row in rows:

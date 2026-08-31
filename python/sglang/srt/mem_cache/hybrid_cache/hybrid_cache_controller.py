@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
     count_pool_hits,
 )
+from sglang.srt import envs
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -676,6 +677,16 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(transfers_nonkv)
+            if envs.SGLANG_DSV4_KV_DIGEST.get():
+                for xfer in transfers_nonkv:
+                    if xfer.host_indices is None:
+                        continue
+                    key0 = str(xfer.keys[0])[:20] if xfer.keys else "?"
+                    logger.warning(
+                        "[KVHOST] phase=prefetch_sidecar pool=%s key0=%s nkeys=%d digest=%s",
+                        xfer.name, key0, len(xfer.keys or []),
+                        self._kv_host_pool_digest(xfer.name, xfer.host_indices),
+                    )
             pool_hits = count_pool_hits(results)
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
@@ -701,6 +712,28 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            if envs.SGLANG_DSV4_KV_DIGEST.get():
+                # key0: use FULL KV anchor key (for KV-derived pools) or the
+                # transfer's own key (for independent pools like C128).
+                kv_key0 = next(
+                    (str(t.keys[0])[:20] for t in (operation.pool_transfers or [])
+                     if t.keys and t.indices_from_pool is None
+                     and t.name not in (PoolName.DEEPSEEK_V4_C128,)),
+                    "?",
+                )
+                for xfer in backup_transfers:
+                    if xfer.host_indices is None:
+                        continue
+                    key0 = (
+                        str(xfer.keys[0])[:20]
+                        if xfer.keys
+                        else kv_key0
+                    )
+                    logger.warning(
+                        "[KVHOST] phase=backup pool=%s key0=%s nkeys=%d digest=%s",
+                        xfer.name, key0, len(xfer.keys or []),
+                        self._kv_host_pool_digest(xfer.name, xfer.host_indices),
+                    )
             results = self.storage_backend.batch_set_v2(backup_transfers)
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
@@ -861,6 +894,38 @@ class HybridCacheController(BaseHiCacheController):
             ratio = self.page_size // slot_page_size
         return indices // ratio if ratio > 1 else indices
 
+    def _kv_host_pool_digest(
+        self, pool_name, host_indices: Optional[torch.Tensor]
+    ) -> str:
+        """Compute abs-sum digest of host pool data at host_indices (debug only)."""
+        if host_indices is None or host_indices.numel() == 0:
+            return "None"
+        try:
+            entry = self.mem_pool_host.entry_map.get(pool_name)
+            if entry is None:
+                return "no_entry"
+            hp = entry.host_pool
+            if hp is None:
+                return "no_pool"
+            sps = getattr(hp, "page_size", None) or getattr(hp, "slot_page_size", None)
+            if not sps:
+                return "no_sps"
+            page_idx = host_indices.reshape(-1, sps)[:, 0].to(torch.int64) // sps
+            kv = getattr(hp, "kv_buffer", None)
+            if kv is None:
+                return "no_kv"
+            if isinstance(kv, list):
+                total = sum(
+                    float(layer[page_idx].abs().float().sum().item())
+                    for layer in kv
+                    if layer is not None
+                )
+            else:
+                total = float(kv[page_idx].abs().float().sum().item())
+            return str(round(total, 3))
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+
     def _alloc_deferred_independent_transfers(
         self,
         pool_transfers: Optional[list[PoolTransfer]],
@@ -906,6 +971,32 @@ class HybridCacheController(BaseHiCacheController):
             transfer.host_indices = host_indices
             transfer.keys = (transfer.keys or [])[:num_keys]
         return True
+
+    def _page_transfer_kv_batch(
+        self,
+        operation,
+        batch_hashes,
+        batch_host_indices,
+        extra_info,
+        kv_derived_transfers,
+    ):
+        result = super()._page_transfer_kv_batch(
+            operation,
+            batch_hashes,
+            batch_host_indices,
+            extra_info,
+            kv_derived_transfers,
+        )
+        if envs.SGLANG_DSV4_KV_DIGEST.get() and kv_derived_transfers:
+            key0 = str(batch_hashes[0])[:20] if batch_hashes else "?"
+            for xfer in kv_derived_transfers:
+                converted = self._map_kv_derived_indices(xfer.name, batch_host_indices)
+                logger.warning(
+                    "[KVHOST] phase=prefetch_kv pool=%s key0=%s nkeys=%d digest=%s",
+                    xfer.name, key0, len(batch_hashes),
+                    self._kv_host_pool_digest(xfer.name, converted),
+                )
+        return result
 
     def storage_prefetch_alignment(
         self, pool_transfers: Optional[list[PoolTransfer]]
