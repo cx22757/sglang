@@ -669,6 +669,17 @@ class TreeComponent(ABC):
         """Cache-level host pre-allocation before a prefetch builds its transfers."""
         return PreparePrefetchResult()
 
+    def align_storage_prefetch_length(
+        self, node: UnifiedTreeNode, prefetch_tokens: int
+    ) -> int:
+        """Return the storage-safe prefix length for this component.
+
+        Most components use the FULL page-aligned candidate unchanged. Components
+        with a coarser correctness boundary may shorten it before storage keys and
+        host allocations are created.
+        """
+        return prefetch_tokens
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,

@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
-
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
 from sglang.srt.arg_groups.attention_hook import (
@@ -1718,6 +1717,17 @@ class TestHiCacheArgs(unittest.TestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "ascend_memcache_direct_with_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "ascend_memcache",
+                    "hicache_io_backend": "direct",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "fa3_kernel_with_explicit_decode_backend",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -1742,6 +1752,49 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_mem_layout=case["expected_mem_layout"],
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
+
+    @patch(
+        "sglang.srt.arg_groups.hicache_hook.model_config_of",
+        return_value=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    @patch("sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True)
+    def test_ascend_memcache_mla_uses_kv_split_layout(self, *_mocks):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="ascend_memcache",
+            hicache_io_backend="kernel_ascend",
+            hicache_mem_layout="layer_first",
+        )
+
+        handle_hicache(args)
+
+        self._assert_hicache_fields(
+            args,
+            expected_io_backend="kernel_ascend",
+            expected_mem_layout="page_first_kv_split",
+        )
+
+    @patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=True)
+    @patch(
+        "sglang.srt.arg_groups.hicache_hook.model_config_of",
+        return_value=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    @patch("sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True)
+    def test_ascend_memcache_dsv4_uses_page_first_direct_layout(self, *_mocks):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="ascend_memcache",
+            hicache_io_backend="kernel_ascend",
+            hicache_mem_layout="layer_first",
+        )
+
+        handle_hicache(args)
+
+        self._assert_hicache_fields(
+            args,
+            expected_io_backend="kernel_ascend",
+            expected_mem_layout="page_first_direct",
+        )
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

@@ -144,6 +144,7 @@ class CacheOperation:
                 keys=[key for t in transfers if t.keys for key in t.keys] or None,
                 hit_policy=transfers[0].hit_policy,
                 indices_from_pool=transfers[0].indices_from_pool,
+                logical_pages_per_object=transfers[0].logical_pages_per_object,
             )
             for transfers in grouped.values()
         ]
@@ -593,7 +594,15 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in [
+                    "hf3fs",
+                    "mooncake",
+                    "ascend_memcache",
+                    "eic",
+                    "nixl",
+                    "simm",
+                    "mori",
+                ]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -737,6 +746,10 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            host_pool_names=tuple(
+                str(entry.name)
+                for entry in (getattr(self.mem_pool_host, "entries", None) or [])
+            ),
         )
 
     def reset(self):
@@ -1063,13 +1076,20 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    # Preserve all remaining progress ACKs for peer reductions.
+                    logger.exception(
+                        "HiCache KV prefetch %s failed.", operation.request_id
+                    )
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False

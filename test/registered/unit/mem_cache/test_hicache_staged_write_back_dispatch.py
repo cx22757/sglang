@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -939,7 +938,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ]
         )
 
-        self.assertIsNone(group.destroy())
+        group.destroy()
+        group.destroy()
+        self.assertEqual(logical_host_pool.available_size(), 0)
 
     def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):
         captured = []

@@ -91,8 +91,13 @@ class LogicalHostPool:
         self.num_release_slots = 0
 
     def destroy(self) -> None:
-        """Logical anchors own no backing buffers or registrations to release."""
-        return None
+        """Release logical allocator state during host-pool teardown."""
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        self.free_slots = torch.empty(0, dtype=torch.int64)
+        self.release_slots = []
+        self.num_release_slots = 0
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
