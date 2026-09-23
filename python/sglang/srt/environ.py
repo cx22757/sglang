@@ -809,9 +809,11 @@ class Envs:
     MOONCAKE_TENANT_ID = EnvStr("default")
 
     # ===================================================================
-    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
+    # Ascend MemCache
     # ===================================================================
+    # HiCache L3 backend configuration; see https://gitcode.com/Ascend/memcache.
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
     # ===================================================================

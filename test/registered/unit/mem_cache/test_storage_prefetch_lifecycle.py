@@ -44,6 +44,7 @@ def _staged_fixture(full_match=2):
         is_eagle=False,
         enable_storage=True,
         prefetch_anchor_info=lambda node: (None, None),
+        node_by_id=Mock(),
         match_full_device_prefix=Mock(return_value=(full_match, 1, full_match)),
         collect_full_device_indices=Mock(return_value=torch.arange(8)),
         inc_full_pin=Mock(),

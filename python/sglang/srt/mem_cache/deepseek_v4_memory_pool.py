@@ -1761,6 +1761,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             start = req_pool_idx * pool.ring_size
             pool.kv_score_buffer[start : start + pool.ring_size].clear()
 
+    def clear_all_c128_req_states(self) -> None:
+        """Reset every request-scoped C128 state bank during a pool flush."""
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            pool.kv_score_buffer.clear()
+
     def clear_unaccepted_c128_draft_states(
         self,
         req_pool_indices: torch.Tensor,

@@ -673,6 +673,16 @@ class TreeComponent(ABC):
         """Size the host staging a prefetch from node_id needs from this component."""
         return PreparePrefetchResult()
 
+    def align_storage_prefetch_length(
+        self, node: UnifiedTreeNode, prefetch_tokens: int
+    ) -> int:
+        """Return the storage-safe prefix length for this component.
+
+        Most components use the FULL page-aligned candidate unchanged. Components
+        with a coarser correctness boundary may shorten it before storage keys and
+        host allocations are created.
+        """
+        return prefetch_tokens
     def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
         return None
