@@ -594,6 +594,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers=None,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -613,6 +618,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.index_kpool = index_kpool
+        self.index_kpool_compress = index_kpool_compress
+        self.kpool_gate_buffer = None
+        if index_kpool > 1:
+            if not index_kpool_compress:
+                raise ValueError("Ascend KPool requires gated compression")
+            if dtype != torch.bfloat16:
+                raise ValueError("Ascend KPool reference cache requires BF16")
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
@@ -658,6 +671,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        if self.index_kpool > 1 and self.dcp_size > 1:
+            raise NotImplementedError(
+                "Ascend KPool reference cache does not support DCP"
+            )
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
         index_page_padding = global_page_padding if index_head_dim is not None else 1
@@ -715,6 +732,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
+                if self.index_kpool > 1:
+                    self.kpool_gate_buffer = torch.zeros_like(self.index_k_buffer)
                 if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
@@ -756,6 +775,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         if self.index_k_scale_buffer is not None:
             kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_buffer)
+        if self.kpool_gate_buffer is not None:
+            kv_size_bytes += get_tensor_size_bytes(self.kpool_gate_buffer)
         return kv_size_bytes
 
     def _raise_if_native_kv_cache_disabled(self):
@@ -784,6 +805,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         buffers = list(self.index_k_buffer)
         if self.index_k_scale_buffer is not None:
             buffers += list(self.index_k_scale_buffer)
+        if self.kpool_gate_buffer is not None:
+            buffers += list(self.kpool_gate_buffer)
         data_ptrs = [buf.data_ptr() for buf in buffers]
         data_lens = [buf.nbytes for buf in buffers]
         item_lens = [buf[0].nbytes for buf in buffers]
@@ -819,6 +842,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
+    def get_kpool_gate_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.kpool_gate_buffer[self._get_indexer_slot(layer_id)]
+
+    def set_kpool_gate_buffer(self, layer_id: int, loc, scores):
+        torch_npu.npu_scatter_nd_update_(
+            self.get_kpool_gate_buffer(layer_id).view(-1, 1, self.index_head_dim),
+            loc.view(-1, 1),
+            scores.to(torch.bfloat16).view(-1, 1, self.index_head_dim),
+        )
+
+    def move_kv_cache(self, tgt_loc, src_loc):
+        if self.kpool_gate_buffer is None:
+            return super().move_kv_cache(tgt_loc, src_loc)
+        # Copy every per-token state component, including uncompressed KPool
+        # keys/gates. Clone first so overlapping relocation is well defined.
+        for local_layer_id in range(self.layer_num):
+            for buffer in self._get_cpu_offload_layer_buffers(local_layer_id):
+                buffer[tgt_loc.long()] = buffer[src_loc.long()].clone()
+
     def _get_indexer_slot(self, layer_id: int) -> int:
         return self.indexer_layer_id_to_slot[layer_id]
 
@@ -845,6 +889,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             entries += [(buffer, True) for buffer in self.index_k_buffer]
             if self.index_k_scale_buffer is not None:
                 entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
+        if self.kpool_gate_buffer is not None:
+            entries += [(buffer, True) for buffer in self.kpool_gate_buffer]
         return entries
 
     # for disagg
@@ -874,7 +920,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_state_layer_ids(self):
         return list(self.indexer_layer_ids) * (
-            2 if self.index_k_scale_buffer is not None else 1
+            1
+            + int(self.index_k_scale_buffer is not None)
+            + int(self.kpool_gate_buffer is not None)
         )
 
     def _pack_dsa_fp8_kv_cache(self, cache_k, cache_v):
@@ -1033,6 +1081,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))
             if self.index_k_scale_buffer is not None:
                 buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
+            if self.kpool_gate_buffer is not None:
+                buffers.append(self.kpool_gate_buffer[slot].flatten(0, 1))
         if self.dsa_kv_cache_store_fp8:
             # Retraction copies opaque records; byte views also avoid FP8
             # advanced-indexing restrictions, without decoding/requantizing.

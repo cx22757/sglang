@@ -537,6 +537,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
+                if get_dsa_index_kpool(kvc.model_config.hf_config) > 1:
+                    # Eager KPool retains a raw key and per-channel gate for
+                    # every FULL slot so chunk/prefix cache boundaries are exact.
+                    indexer_size_per_token *= 2
             if not is_npu_arch35():
                 allocate_all_layers = True
         memory_config = get_memory()
