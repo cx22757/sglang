@@ -1,3 +1,4 @@
+import logging
 import math
 from typing import Optional
 
@@ -14,6 +15,37 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _LOG2_E = math.log2(math.e)
+logger = logging.getLogger(__name__)
+
+
+def _kda_extend_reference(
+    q, k, v, g, beta, initial_state, query_start_loc, *, return_intermediate_states
+):
+    """Slow eager recurrence for Ascend builds without the chunk KDA operator.
+
+    Inputs have normalized q/k and activated log-decay/beta. States use
+    [sequence, head, value, key], matching the native Ascend cache.
+    """
+    boundaries = query_start_loc.cpu().tolist()
+    output = torch.empty_like(v)
+    final_states = []
+    chunk_states = []
+    for sequence, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        state = initial_state[sequence].float().clone()
+        for token in range(start, end):
+            if return_intermediate_states and (token - start) % 64 == 0:
+                chunk_states.append(state.clone())
+            key = k[0, token].float()
+            state = state * g[0, token].float().exp().unsqueeze(-2)
+            residual = v[0, token].float() - (state * key.unsqueeze(-2)).sum(-1)
+            residual = residual * beta[0, token].float().unsqueeze(-1)
+            state = state + residual.unsqueeze(-1) * key.unsqueeze(-2)
+            query = q[0, token].float() * (q.shape[-1] ** -0.5)
+            output[0, token] = (state * query.unsqueeze(-2)).sum(-1).to(v.dtype)
+        final_states.append(state)
+    final_state = torch.stack(final_states)
+    snapshots = torch.stack(chunk_states).unsqueeze(0) if chunk_states else None
+    return output, final_state, snapshots
 
 
 class _AscendKDAExtendKernel:
@@ -58,24 +90,42 @@ class _AscendKDAExtendKernel:
         scale = k.shape[-1] ** -0.5
         query_start_loc = query_start_loc.to(dtype=torch.int64).contiguous()
 
-        outputs = torch.ops.npu.chunk_kda_fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=query_start_loc,
-            chunk_size=chunk_size,
-            layout="BSND",
-            safe_gate=False,
-            use_gate_in_kernel=False,
-            state_v_first=True,
-            output_h=return_intermediate_states,
-        )
-        out, final_state, chunk_states = outputs[0], outputs[1], outputs[10]
+        if not hasattr(torch.ops.npu, "chunk_kda_fwd"):
+            if not getattr(self, "_reference_warned", False):
+                logger.warning(
+                    "Ascend chunk_kda_fwd is unavailable; using slow eager KDA "
+                    "prefill for correctness validation."
+                )
+                self._reference_warned = True
+            out, final_state, chunk_states = _kda_extend_reference(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                query_start_loc,
+                return_intermediate_states=return_intermediate_states,
+            )
+        else:
+            outputs = torch.ops.npu.chunk_kda_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=query_start_loc,
+                chunk_size=chunk_size,
+                layout="BSND",
+                safe_gate=False,
+                use_gate_in_kernel=False,
+                state_v_first=True,
+                output_h=return_intermediate_states,
+            )
+            out, final_state, chunk_states = outputs[0], outputs[1], outputs[10]
         valid_positions = valid_state_mask.nonzero(as_tuple=False).flatten()
         ssm_states.index_copy_(
             0,
