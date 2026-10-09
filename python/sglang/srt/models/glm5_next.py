@@ -121,6 +121,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
@@ -136,6 +137,7 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 # Matches DeepSeek-V4's _MHC_POST_MULT_VALUE; the fused and unfused boundaries
 # must agree on it.
@@ -674,7 +676,16 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        if _is_npu:
+            # GLM uses a sigmoid gate, unlike the SiLU gate in other KDA models.
+            value = core_attn_out.float()
+            value = value * torch.rsqrt(
+                value.square().mean(dim=-1, keepdim=True) + self.o_norm.eps
+            )
+            value = value * self.o_norm.weight.float() * norm_gate.float().sigmoid()
+            core_attn_out = value.to(core_attn_out.dtype)
+        else:
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
         return cp_sequence_to_interleave_order(
@@ -1214,6 +1225,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "model.visual": "visual",
+            ".attn_hc.": ".hc_attn_",
+            ".ffn_hc.": ".hc_ffn_",
+            ".self_attn.forget_gate.": ".self_attn.",
         },
         orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -1730,7 +1744,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return name
 
         weight_names = []
-        for name, loaded_weight in weights:
+        for name, loaded_weight in self.hf_to_sglang_mapper.apply(weights):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
