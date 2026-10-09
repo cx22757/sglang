@@ -420,9 +420,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     XpuGDNAttnBackend as GDNAttnBackend,
                 )
         else:
-            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
-                AscendGDNAttnBackend as GDNAttnBackend,
-            )
             from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
                 AscendHybridLinearAttnBackend as HybridLinearAttnBackend,
             )
@@ -457,6 +454,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     f"Got prefill={prefill_be}, decode={decode_be}."
                 )
             elif is_npu():
+                from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                    AscendGDNAttnBackend as GDNAttnBackend,
+                )
+
                 assert (
                     runner.prefill_attention_backend_str == "ascend"
                     and runner.decode_attention_backend_str == "ascend"
