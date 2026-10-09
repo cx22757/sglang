@@ -664,7 +664,12 @@ class Glm5NextLinearAttention(nn.Module):
                 hidden_states, forward_batch
             )
 
-        if not forward_batch.forward_mode.is_decode():
+        if not forward_batch.forward_mode.is_decode() and not (
+            _is_npu and forward_batch.forward_mode.is_target_verify()
+        ):
+            if _is_npu:
+                # Ascend KDA prefill shares Kimi's [1, T, H, K] gate contract.
+                forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
