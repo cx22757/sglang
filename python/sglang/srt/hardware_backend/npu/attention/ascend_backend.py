@@ -1364,7 +1364,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            k_rope = k_rope.view(k.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim)
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
@@ -1472,8 +1472,8 @@ class AscendAttnBackend(AttentionBackend):
                     query=q_nope,
                     key=k_nope,
                     value=k_nope,
-                    query_rope=q_pe,
-                    key_rope=k_pe,
+                    query_rope=q_pe if self.qk_rope_head_dim else None,
+                    key_rope=k_pe if self.qk_rope_head_dim else None,
                     sparse_indices=topk_indices,
                     scale_value=layer.scaling,
                     actual_seq_lengths_query=actual_seq_qlen.to(

@@ -995,6 +995,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
+        if self.qk_rope_head_dim == 0:
+            return
         torch_npu.npu_scatter_nd_update_(
             self.v_buffer[layer_id - self.start_layer].view(
                 -1, 1, self.qk_rope_head_dim
@@ -1023,7 +1025,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         offset = layer_id - self.start_layer
         scatter(self.k_buffer[offset], cache_k, self.kv_lora_rank)
-        scatter(self.v_buffer[offset], cache_v, self.qk_rope_head_dim)
+        if self.qk_rope_head_dim:
+            scatter(self.v_buffer[offset], cache_v, self.qk_rope_head_dim)
 
     def set_index_k_buffer(
         self,
