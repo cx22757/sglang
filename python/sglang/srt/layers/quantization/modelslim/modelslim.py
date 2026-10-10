@@ -426,6 +426,8 @@ class ModelSlimConfig(QuantizationConfig):
                     f"Unsupported scheme '{name}' for layer {resolved_prefix}"
                 )
                 return None
+            if cls is ModelSlimW4A8Int8MoE:
+                return cls(self, weight_group, tp_size=layer.moe_tp_size)
             return cls(self, weight_group)
 
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
