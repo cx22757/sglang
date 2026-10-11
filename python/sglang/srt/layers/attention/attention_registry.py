@@ -420,9 +420,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     XpuGDNAttnBackend as GDNAttnBackend,
                 )
         else:
-            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
-                AscendGDNAttnBackend as GDNAttnBackend,
-            )
             from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
                 AscendHybridLinearAttnBackend as HybridLinearAttnBackend,
             )
@@ -457,6 +454,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     f"Got prefill={prefill_be}, decode={decode_be}."
                 )
             elif is_npu():
+                from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                    AscendGDNAttnBackend as GDNAttnBackend,
+                )
+
                 assert (
                     runner.prefill_attention_backend_str == "ascend"
                     and runner.decode_attention_backend_str == "ascend"
@@ -515,7 +516,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
-        elif kimi_linear_config(runner.model_config) is not None:
+        elif (
+            kimi_linear_config(runner.model_config) is not None
+            or glm5_next_config(runner.model_config) is not None
+        ):
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
                     AscendKDAAttnBackend,
@@ -526,8 +530,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
-        elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

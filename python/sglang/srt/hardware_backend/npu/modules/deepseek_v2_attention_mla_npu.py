@@ -381,6 +381,7 @@ def forward_dsa_prepare_npu(
     dynamic_scale = None
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
+        and m.rotary_emb is not None
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
     if mla_preprocess_used:
@@ -403,7 +404,7 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        if m.rotary_emb.is_neox_style:
+        if m.rotary_emb is None or m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
@@ -473,18 +474,18 @@ def forward_dsa_prepare_npu(
             perm_y=(1, 0, 2),
         )
 
-        if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
-            # Match the half-layout RoPE outputs used by MLA preprocessing.
-            q_pe, k_pe = _apply_interleaved_rope_with_half_output(
-                m.rotary_emb, positions, q_pe, k_pe
-            )
-        else:
-            if m.layer_id == get_token_to_kv_pool().start_layer:
-                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
-                    0, positions
+        if m.rotary_emb is not None:
+            if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
+                # Match the half-layout RoPE outputs used by MLA preprocessing.
+                q_pe, k_pe = _apply_interleaved_rope_with_half_output(
+                    m.rotary_emb, positions, q_pe, k_pe
                 )
-            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
-
+            else:
+                if m.layer_id == get_token_to_kv_pool().start_layer:
+                    m.rotary_emb.sin_cos_cache = (
+                        m.rotary_emb.cos_sin_cache.index_select(0, positions)
+                    )
+                q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(

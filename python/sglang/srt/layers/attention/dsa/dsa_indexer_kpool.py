@@ -1636,6 +1636,33 @@ class IndexerKPool(MultiPlatformOp):
             return None
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
+    def forward_npu(
+        self,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        layer_id,
+        input_on_attn_tp_slices=False,
+        dynamic_scale=None,
+        return_indices=True,
+    ):
+        from sglang.srt.hardware_backend.npu.attention.ascend_glm5_kpool import (
+            forward_kpool_npu,
+        )
+
+        if input_on_attn_tp_slices and x.shape[0] != positions.shape[0]:
+            from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+                scattered_to_tp_attn_full,
+            )
+
+            x = scattered_to_tp_attn_full(x, forward_batch)
+        if dynamic_scale is not None:
+            q_lora = (q_lora, dynamic_scale)
+        return forward_kpool_npu(
+            self, x, q_lora, positions, forward_batch, layer_id, return_indices
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,

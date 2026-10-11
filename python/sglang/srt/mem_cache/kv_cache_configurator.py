@@ -1914,6 +1914,14 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            index_kpool=(
+                get_dsa_index_kpool(self.model_config.hf_config) if is_dsa_model else 1
+            ),
+            index_kpool_compress=(
+                get_dsa_index_kpool_compress(self.model_config.hf_config)
+                if is_dsa_model
+                else False
+            ),
             index_size=index_size,
             index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
@@ -2321,7 +2329,11 @@ class KVCacheConfigurator:
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
-        if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
+        if (
+            (not _is_npu or get_dsa_index_kpool(self.model_config.hf_config) == 1)
+            and self.use_mla_backend
+            and is_deepseek_dsa(self.model_config.hf_config)
+        ):
             return dsa_pool_class
         if _is_npu:
             if self.use_mla_backend:

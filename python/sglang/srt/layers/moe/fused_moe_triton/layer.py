@@ -1332,6 +1332,15 @@ class FusedMoE(torch.nn.Module):
 
         # Case weight scales and zero_points
         if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
+            if (
+                shard_id == "w2"
+                and getattr(param, "modelslim_input_group_bias", False)
+                and not self.use_presharded_weights
+            ):
+                local_groups = expert_data.shape[-1]
+                loaded_weight = loaded_weight.narrow(
+                    -1, self.moe_tp_rank * local_groups, local_groups
+                )
             # load the weight scales and zp based on the quantization scheme
             # supported weight scales/zp can be found in
             # FusedMoeWeightScaleSupported

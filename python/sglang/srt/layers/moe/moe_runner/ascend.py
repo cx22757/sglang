@@ -171,7 +171,7 @@ class AscendRunnerCore(MoeRunnerCore):
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+                inner = NPUSwigluQuant(clamp_limit=config.swiglu_limit)
             elif config.activation == "situ":
                 # Grouped SiTU (Kimi-K3). need_quant=False: the MXFP4 / BF16
                 # gmm2 requantizes the activations itself, so no quant is

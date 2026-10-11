@@ -1364,7 +1364,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            k_rope = k_rope.view(k.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim)
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
@@ -1468,6 +1468,11 @@ class AscendAttnBackend(AttentionBackend):
                     rope_head_dim=self.qk_rope_head_dim,
                 )
             else:
+                if self.qk_rope_head_dim == 0:
+                    # CANN SFA requires a 64-wide RoPE input even for models
+                    # without RoPE. Zero tails add no query-key dot product.
+                    q_pe = q_nope.new_zeros((*q_nope.shape[:-1], 64))
+                    k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                     query=q_nope,
                     key=k_nope,

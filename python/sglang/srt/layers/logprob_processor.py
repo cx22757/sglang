@@ -84,7 +84,8 @@ def compute_row_log_normalizer(
     shift-invariant order as log-softmax; a single absolute normalizer would
     round the log_sum term away for rows with a large common offset.
     """
-    if logits.is_cuda:
+    # transfer_to_npu can report is_cuda=True for an NPU tensor.
+    if logits.device.type == "cuda":
         from sglang.srt.layers.logsumexp import row_logsumexp
 
         return row_logsumexp(logits)
@@ -524,7 +525,7 @@ class InputLogprobProcessor:
             chunk_size = self.logprobs_chunk_size
 
         borrow_logprob_memory = False
-        if pruned_states.is_cuda:
+        if pruned_states.device.type == "cuda":
             borrow_logprob_memory = self._can_borrow_logprob_memory(
                 chunk_size=chunk_size,
                 borrow_logits=not skip_chunking_for_dp_attn,
@@ -622,7 +623,7 @@ class InputLogprobProcessor:
         split_len_token_ids = 0
 
         fused_kernel, fused_max_k = None, 0
-        if self.enable_fast_input_logprobs and pruned_states.is_cuda:
+        if self.enable_fast_input_logprobs and pruned_states.device.type == "cuda":
             from sglang.srt.layers.logsumexp import (
                 FUSED_TOPK_MAX_K,
                 row_logsumexp_topk,

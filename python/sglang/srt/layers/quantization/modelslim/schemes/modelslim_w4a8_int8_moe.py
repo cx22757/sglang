@@ -139,6 +139,10 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         )
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
         set_weight_attrs(scale_bias, extra_weight_attrs)
+        if prefix == "w2":
+            # These columns compensate contiguous input-K groups, so they follow
+            # the row-parallel weight partition rather than output channels.
+            set_weight_attrs(scale_bias, {"modelslim_input_group_bias": True})
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Delegate weight processing to the kernel for the assigned weight group."""
