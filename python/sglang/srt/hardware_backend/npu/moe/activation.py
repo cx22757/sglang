@@ -28,8 +28,19 @@ class NPUSwiglu(BaseActivation):
         return torch.ops.npu.npu_swiglu(hidden_states), None
 
 
+def _clamp_swiglu_inputs(hidden_states: torch.Tensor, limit: float) -> torch.Tensor:
+    gate, up = hidden_states.chunk(2, dim=-1)
+    return torch.cat((gate.clamp(max=limit), up.clamp(min=-limit, max=limit)), -1)
+
+
 class NPUSwigluQuant(BaseActivation):
+    def __init__(self, clamp_limit: Optional[float] = None):
+        self.clamp_limit = clamp_limit
+
     def _apply_activation(self, hidden_states: torch.Tensor):
+        if self.clamp_limit is not None:
+            # Clamp the raw gate before SiLU, matching the model's SwiGLU.
+            hidden_states = _clamp_swiglu_inputs(hidden_states, self.clamp_limit)
         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
             hidden_states,
             quant_mode=1,
