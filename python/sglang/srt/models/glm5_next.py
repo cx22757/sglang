@@ -1739,6 +1739,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
+        audit = None
+        if envs.SGLANG_DEBUG_GLM5_WEIGHT_LOADING.get() and not is_nextn:
+            from sglang.srt.layers.linear import get_group_rank_size
+            from sglang.srt.models.glm5_next_weight_audit import Glm5WeightLoadingAudit
+
+            rank, tp_size = get_group_rank_size(
+                self.model.layers[0].self_attn.qkv_proj.tp_group
+            )
+            audit = Glm5WeightLoadingAudit(params_dict, rank, tp_size)
+            weights = audit.observe_sources(weights)
+
         def maybe_map_fp8_block_scale_name(name: str) -> str:
             # Quark stores dequantization scales without native block-FP8's
             # "_inv" suffix, including fused w13/w2 expert parameters.
@@ -1832,6 +1843,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                if audit is not None:
+                    audit.record_loaded(name, shard_id)
                 break
             else:
                 is_expert_weight = False
@@ -1916,6 +1929,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+                    if audit is not None:
+                        audit.record_loaded(name)
+
+        if audit is not None:
+            audit.finish()
 
         if getattr(self, "encoder_only", False):
             run_post = False
