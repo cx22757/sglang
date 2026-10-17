@@ -35,7 +35,7 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.conv import Conv3dLayer
+from sglang.srt.layers.conv import Conv2dLayer, Conv3dLayer
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -456,12 +456,25 @@ class Glm4vVisionModel(nn.Module):
         self.post_conv_layernorm = Glm4vRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
         )
-        self.downsample = nn.Conv2d(
-            in_channels=vision_config.hidden_size,
-            out_channels=vision_config.out_hidden_size,
-            kernel_size=vision_config.spatial_merge_size,
-            stride=vision_config.spatial_merge_size,
-        )
+        if is_npu():
+            # kernel == stride with no padding is mathematically an
+            # unfold + linear; Conv2dLayer's GEMM path is faster than
+            # the Conv2D kernel on NPU for the batched vision encoder.
+            self.downsample = Conv2dLayer(
+                in_channels=vision_config.hidden_size,
+                out_channels=vision_config.out_hidden_size,
+                kernel_size=vision_config.spatial_merge_size,
+                stride=vision_config.spatial_merge_size,
+                bias=True,
+                disable_linear=False,
+            )
+        else:
+            self.downsample = nn.Conv2d(
+                in_channels=vision_config.hidden_size,
+                out_channels=vision_config.out_hidden_size,
+                kernel_size=vision_config.spatial_merge_size,
+                stride=vision_config.spatial_merge_size,
+            )
         self.post_layernorm = Glm4vRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
         )
