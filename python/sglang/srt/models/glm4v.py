@@ -35,7 +35,7 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.conv import Conv2dLayer, Conv3dLayer
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -456,25 +456,15 @@ class Glm4vVisionModel(nn.Module):
         self.post_conv_layernorm = Glm4vRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
         )
-        if is_npu():
-            # kernel == stride with no padding is mathematically an
-            # unfold + linear; Conv2dLayer's GEMM path is faster than
-            # the Conv2D kernel on NPU for the batched vision encoder.
-            self.downsample = Conv2dLayer(
-                in_channels=vision_config.hidden_size,
-                out_channels=vision_config.out_hidden_size,
-                kernel_size=vision_config.spatial_merge_size,
-                stride=vision_config.spatial_merge_size,
-                bias=True,
-                disable_linear=False,
-            )
-        else:
-            self.downsample = nn.Conv2d(
-                in_channels=vision_config.hidden_size,
-                out_channels=vision_config.out_hidden_size,
-                kernel_size=vision_config.spatial_merge_size,
-                stride=vision_config.spatial_merge_size,
-            )
+        self.downsample = nn.Conv2d(
+            in_channels=vision_config.hidden_size,
+            out_channels=vision_config.out_hidden_size,
+            kernel_size=vision_config.spatial_merge_size,
+            stride=vision_config.spatial_merge_size,
+        )
+        # One-time NHWC-ordered GEMM weight derived from downsample.weight on
+        # first NPU forward; weights are loaded before any forward runs.
+        self._downsample_linear_weight: Optional[torch.Tensor] = None
         self.post_layernorm = Glm4vRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
         )
@@ -572,8 +562,19 @@ class Glm4vVisionModel(nn.Module):
         # adapter
         x = self.post_layernorm(x)
         x = x.view(-1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1])
-        x = x.permute(0, 3, 1, 2)
-        x = self.downsample(x).view(-1, self.out_hidden_size)
+        if is_npu():
+            # kernel == stride conv is a GEMM over flattened (h, w, c); the
+            # NHWC input is already in that order, so skip the NCHW permute
+            # and layout copy entirely. Equivalent within fp16 rounding to
+            # the Conv2d path (verified against an FP32 reference).
+            weight = self._downsample_linear_weight
+            if weight is None:
+                w = self.downsample.weight
+                weight = w.permute(0, 2, 3, 1).reshape(w.shape[0], -1).contiguous()
+                self._downsample_linear_weight = weight
+            x = F.linear(x.reshape(x.shape[0], -1), weight, self.downsample.bias)
+        else:
+            x = self.downsample(x.permute(0, 3, 1, 2)).view(-1, self.out_hidden_size)
         x = self.merger(x)
 
         return x
