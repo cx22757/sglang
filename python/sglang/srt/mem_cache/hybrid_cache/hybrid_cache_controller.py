@@ -62,6 +62,7 @@ class PPPrefetchPoolSpec:
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     indices_from_pool: Optional[PoolName] = None
+    logical_pages_per_object: int = 1
 
     @classmethod
     def from_transfer(cls, transfer: PoolTransfer) -> PPPrefetchPoolSpec:
@@ -76,6 +77,7 @@ class PPPrefetchPoolSpec:
             keys=list(transfer.keys) if transfer.keys is not None else None,
             hit_policy=transfer.hit_policy,
             indices_from_pool=transfer.indices_from_pool,
+            logical_pages_per_object=transfer.logical_pages_per_object,
         )
 
 
@@ -721,6 +723,10 @@ class HybridCacheController(BaseHiCacheController):
             if entry is None:
                 continue
             num_pages = len(transfer.keys or [])
+            if transfer.logical_pages_per_object > 1:
+                num_pages = min(
+                    num_pages, sidecar_hit_pages // transfer.logical_pages_per_object
+                )
             if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 num_pages = min(num_pages or 1, sidecar_hit_pages)
             requests.append((transfer.name, num_pages * entry.host_pool.page_size))
@@ -1177,7 +1183,9 @@ class HybridCacheController(BaseHiCacheController):
                         spec.num_slots,
                         min(
                             len(spec.keys or []),
-                            ticket.storage_hit_count // self.page_size,
+                            ticket.storage_hit_count
+                            // self.page_size
+                            // spec.logical_pages_per_object,
                         ),
                     )
                 if indices is None:
@@ -1198,6 +1206,7 @@ class HybridCacheController(BaseHiCacheController):
                     keys=list(spec.keys) if spec.keys is not None else None,
                     hit_policy=spec.hit_policy,
                     indices_from_pool=spec.indices_from_pool,
+                    logical_pages_per_object=spec.logical_pages_per_object,
                 )
             )
 
@@ -1306,6 +1315,7 @@ class HybridCacheController(BaseHiCacheController):
                                     keys=spec.keys,
                                     hit_policy=spec.hit_policy,
                                     indices_from_pool=spec.indices_from_pool,
+                                    logical_pages_per_object=spec.logical_pages_per_object,
                                 )
                                 for spec in ticket.pool_specs
                             ]
@@ -1517,6 +1527,12 @@ class HybridCacheController(BaseHiCacheController):
                 else kv_completed_pages
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
+            for transfer in transfers_nonkv:
+                coverage = transfer.logical_pages_per_object
+                if coverage > 1:
+                    transfer.keys = sidecar_hashes[
+                        coverage - 1 : sidecar_hit_pages : coverage
+                    ]
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             try:
                 results = {}

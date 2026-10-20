@@ -16,10 +16,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    resolve_pool_transfer_hits,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
@@ -878,75 +878,56 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             kv_pages = self.batch_exists(keys, extra_info)
 
-        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        # Start from every KV prefix and let each pool remove the stop points it
-        # cannot serve. Collect the whole set, not just its maximum: a
-        # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
-        # caller has to intersect these sets across ranks.
-        restorable = list(range(1, kv_pages + 1))
-
-        if not restorable:
-            return PoolTransferResult(0, hit_count, [])
+        if not kv_pages:
+            return PoolTransferResult(0, {}, [])
 
         prepared = []
         all_component_keys = []
         for transfer in pool_transfers or []:
+            coverage = transfer.logical_pages_per_object
+            if coverage <= 0:
+                raise ValueError(
+                    f"Mooncake hybrid pool {transfer.name} has invalid "
+                    f"logical_pages_per_object={coverage}"
+                )
+            # Derive coarse object keys from the namespaced FULL hash chain,
+            # independently of prefetch placeholders, at complete group ends.
+            object_keys = keys[coverage - 1 : kv_pages : coverage]
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                object_keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
             start = len(all_component_keys)
             all_component_keys.extend(component_keys)
-            prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
+            prepared.append(
+                (
+                    transfer,
+                    len(object_keys),
+                    key_multiplier,
+                    start,
+                    len(all_component_keys),
+                )
+            )
 
         all_exists = (
             self._batch_exist(all_component_keys, extra_info)
             if all_component_keys
             else []
         )
-        for transfer, key_multiplier, start, end in prepared:
-            if not restorable:
-                break
+        pool_page_exists = []
+        for transfer, object_count, key_multiplier, start, end in prepared:
             ex = all_exists[start:end]
-            if key_multiplier > 0:
-                page_exists = [
-                    all(
-                        r == 1
-                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
-                    )
-                    for i in range(kv_pages)
-                ]
-            else:
-                page_exists = [False] * kv_pages
-            boundary = 0
-            pool_restorable = []
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-                pool_restorable = list(range(1, boundary + 1))
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                # A stop point works when the window ending there is complete,
-                # so scan every one instead of stopping at the longest.
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        pool_restorable.append(prefix_len)
-                        if boundary == 0:
-                            boundary = prefix_len
-            else:
-                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
-            if boundary:
-                hit_count[transfer.name] = boundary
-            pool_restorable_set = set(pool_restorable)
-            restorable = [p for p in restorable if p in pool_restorable_set]
-
-        final_pages = restorable[-1] if restorable else 0
-        return PoolTransferResult(final_pages, hit_count, restorable)
+            page_exists = [
+                key_multiplier > 0
+                and len(ex[i * key_multiplier : (i + 1) * key_multiplier])
+                == key_multiplier
+                and all(
+                    r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                )
+                for i in range(object_count)
+            ]
+            pool_page_exists.append(page_exists)
+        return resolve_pool_transfer_hits(kv_pages, pool_transfers, pool_page_exists)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Expand every pool first so one logical operation becomes one Mooncake
@@ -965,7 +946,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             page_size = host_pool.page_size or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
-            assert len(keys) == len(host_indices) // page_size
+            native_pages, remainder = divmod(len(host_indices), page_size)
+            if remainder or len(keys) != native_pages:
+                raise ValueError(
+                    f"Mooncake hybrid pool {transfer.name} key/page mismatch: "
+                    f"keys={len(keys)}, indices={len(host_indices)}, "
+                    f"page_size={page_size}"
+                )
 
             tagged_keys = self._tag_keys(keys)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
